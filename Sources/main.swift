@@ -1,6 +1,7 @@
 import Cocoa
 import AVFoundation
 import IOKit.hid
+import Speech
 
 // MARK: - Settings
 
@@ -83,7 +84,7 @@ final class QuillApp: NSObject, NSApplicationDelegate {
     private let hotkey = DoubleTapRightCommand()
     private let recorder = Recorder()
     private let hud = HUD()
-    private var stt: STTClient?
+    private var stt: StreamingTranscriber?
 
     private var statusItem: NSStatusItem!
     private var isRecording = false
@@ -664,6 +665,16 @@ final class QuillApp: NSObject, NSApplicationDelegate {
     }
 
     private func beginCapture() {
+        let language = UserDefaults.standard.string(forKey: Defaults.language) ?? "el"
+        // Greek: Apple Speech (el-GR). Everything else: Grok streaming STT.
+        // xAI's STT is not competitive on Modern Greek; Apple's model is.
+        let useAppleGreek = (language == "el")
+
+        if useAppleGreek {
+            startAppleGreekCapture()
+            return
+        }
+
         guard let creds = Auth.current() else {
             hud.apply(.notice("No Grok Build session found — run `grok` once to sign in"))
             hud.collapse(after: 4)
@@ -671,6 +682,49 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         }
 
         let client = STTClient()
+        wireTranscriber(client, creds: creds, language: language)
+
+        if let selfTestPath {
+            startSelfTest(path: selfTestPath, client: client)
+            return
+        }
+
+        startMicAndRecord()
+    }
+
+    /// Apple el-GR path — needs Speech permission, not a Grok token.
+    private func startAppleGreekCapture() {
+        let start: () -> Void = { [weak self] in
+            guard let self else { return }
+            let client = AppleSTTClient()
+            self.wireTranscriber(client, creds: Auth.current(), language: "el")
+            client.connect(language: "el")
+            self.startMicAndRecord()
+        }
+
+        switch SFSpeechRecognizer.authorizationStatus() {
+        case .authorized:
+            start()
+        case .notDetermined:
+            AppleSTTClient.requestAuthorization { [weak self] granted in
+                guard let self else { return }
+                guard granted else {
+                    self.hud.apply(.notice("Speech Recognition denied — enable Quill in Privacy & Security ▸ Speech Recognition"))
+                    self.hud.collapse(after: 5)
+                    return
+                }
+                start()
+            }
+        default:
+            hud.apply(.notice("Enable Quill in Privacy & Security ▸ Speech Recognition"))
+            hud.collapse(after: 5)
+            Inserter.openPrivacyPane("Privacy_SpeechRecognition")
+        }
+    }
+
+    private func wireTranscriber(_ client: StreamingTranscriber,
+                                 creds: Auth.Creds?,
+                                 language: String) {
         stt = client
         pendingPCM = []
         socketReady = false
@@ -695,27 +749,23 @@ final class QuillApp: NSObject, NSApplicationDelegate {
             }
 
             self.considerVoiceStop(after: text)
-            // Only NEW words count as activity. The server re-sends an unchanged
-            // partial every couple of hundred milliseconds, so treating every
-            // callback as speech kept the session alive forever.
             if text != self.lastActivityText {
                 self.lastActivityText = text
                 self.noteVoiceActivity()
             }
 
-            // Show what will actually be inserted, command phrases already removed.
             self.hud.update(text: VoiceCommands.stripAll(text))
         }
         client.onComplete = { [weak self] text in self?.finishSession(with: text) }
-        client.onFailure = { [weak self] failure in self?.abortSession(message: failure.message) }
+        client.onFailure = { [weak self] message in self?.abortSession(message: message) }
 
-        // Open the connection while they are still talking: a cold request
-        // measured ~1.9s against ~0.8s warm, which is the whole difference
-        // between this feeling instant and feeling like a wait.
-        if Defaults.bool(Defaults.polish) { Polisher.warm(token: creds.token) }
+        if Defaults.bool(Defaults.polish), let token = creds?.token {
+            Polisher.warm(token: token)
+        }
 
-        let language = UserDefaults.standard.string(forKey: Defaults.language) ?? "el"
-        client.connect(token: creds.token, language: language)
+        if let grok = client as? STTClient, let token = creds?.token {
+            grok.connect(token: token, language: language)
+        }
 
         recorder.onPCM = { [weak self] data in
             guard let self else { return }
@@ -729,12 +779,9 @@ final class QuillApp: NSObject, NSApplicationDelegate {
                 self.hud.update(level: level)
             }
         }
+    }
 
-        if let selfTestPath {
-            startSelfTest(path: selfTestPath, client: client)
-            return
-        }
-
+    private func startMicAndRecord() {
         do {
             try recorder.start()
         } catch {
@@ -744,7 +791,6 @@ final class QuillApp: NSObject, NSApplicationDelegate {
             hud.collapse(after: 3.5)
             return
         }
-
         enterRecordingState()
     }
 

@@ -25,7 +25,7 @@ for ARCH in arm64 x86_64; do
     -O \
     -target "$ARCH-apple-macos12.0" \
     -sdk "$SDK" \
-    -framework Cocoa -framework AVFoundation -framework QuartzCore \
+    -framework Cocoa -framework AVFoundation -framework QuartzCore -framework Speech \
     Sources/*.swift \
     -o "$BUILD/$APP_NAME-$ARCH"
 done
@@ -48,7 +48,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>12.0</string>
   <key>LSUIElement</key><true/>
   <key>NSMicrophoneUsageDescription</key>
-  <string>Quill records your voice and streams it to Grok speech-to-text, using your Grok Build session.</string>
+  <string>Quill records your voice for speech-to-text dictation.</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>Quill uses Apple speech recognition for accurate Greek dictation on your Mac.</string>
   <key>NSHumanReadableCopyright</key><string>freeze</string>
 </dict>
 </plist>

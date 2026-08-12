@@ -45,7 +45,7 @@ final class STTClient: NSObject, URLSessionWebSocketDelegate {
     var onReady: () -> Void = {}
     /// Terminal: the complete transcript.
     var onComplete: (String) -> Void = { _ in }
-    var onFailure: (Failure) -> Void = { _ in }
+    var onFailure: (String) -> Void = { _ in }
 
     var transcript: String {
         segmentOrder.compactMap { segments[$0] }.joined(separator: " ")
@@ -202,7 +202,9 @@ final class STTClient: NSObject, URLSessionWebSocketDelegate {
             let message = (object["message"] as? String)
                 ?? (object["error"] as? String)
                 ?? "Transcription error"
-            DispatchQueue.main.async { [weak self] in self?.onFailure(.server(message)) }
+            DispatchQueue.main.async { [weak self] in
+                self?.onFailure(Failure.server(message).message)
+            }
 
         default:
             break
@@ -214,7 +216,9 @@ final class STTClient: NSObject, URLSessionWebSocketDelegate {
 
         if let response = task?.response as? HTTPURLResponse, response.statusCode == 401 || response.statusCode == 403 {
             didFinish = true
-            DispatchQueue.main.async { [weak self] in self?.onFailure(.unauthorized) }
+            DispatchQueue.main.async { [weak self] in
+                self?.onFailure(Failure.unauthorized.message)
+            }
             return
         }
 
@@ -229,7 +233,9 @@ final class STTClient: NSObject, URLSessionWebSocketDelegate {
         let message = ns.code == NSURLErrorNotConnectedToInternet
             ? "No network connection"
             : ns.localizedDescription
-        DispatchQueue.main.async { [weak self] in self?.onFailure(.offline(message)) }
+        DispatchQueue.main.async { [weak self] in
+            self?.onFailure(Failure.offline(message).message)
+        }
     }
 
     // MARK: URLSessionWebSocketDelegate
@@ -255,8 +261,10 @@ final class STTClient: NSObject, URLSessionWebSocketDelegate {
         } else {
             didFinish = true
             DispatchQueue.main.async { [weak self] in
-                self?.onFailure(.server("Connection closed (code \(closeCode.rawValue))"))
+                self?.onFailure(Failure.server("Connection closed (code \(closeCode.rawValue))").message)
             }
         }
     }
 }
+
+extension STTClient: StreamingTranscriber {}
