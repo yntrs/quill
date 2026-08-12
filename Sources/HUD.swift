@@ -127,6 +127,7 @@ final class HUD {
     func update(level: Float)      { content.setLevel(level) }
     func update(elapsed: TimeInterval) { content.setElapsed(elapsed) }
     func update(translateCaption: String?) { content.setTranslateCaption(translateCaption) }
+    func update(usagePercent: Int?) { content.setUsagePercent(usagePercent) }
     func update(target app: String?, icon: NSImage?) {
         guard Date() >= (targetOverrideUntil ?? .distantPast) else { return }
         content.setTarget(app, icon: icon)
@@ -305,7 +306,10 @@ private final class HUDView: NSView {
     private let dot = NSView()
     private let elapsedLabel = NSTextField(labelWithString: "0:00")
     private let waveform = WaveformView()
+    private let usageLabel = NSTextField(labelWithString: "")
     private let translateLabel = NSTextField(labelWithString: "")
+    private var translateAfterUsage: NSLayoutConstraint!
+    private var translateAfterWave: NSLayoutConstraint!
     private let targetLabel = NSTextField(labelWithString: "")
     private let targetIcon = NSImageView()
     private let transcriptLabel = NSTextField(labelWithString: "")
@@ -389,6 +393,13 @@ private final class HUDView: NSView {
 
         waveform.translatesAutoresizingMaskIntoConstraints = false
 
+        usageLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+        usageLabel.textColor = NSColor.white.withAlphaComponent(0.55)
+        usageLabel.translatesAutoresizingMaskIntoConstraints = false
+        usageLabel.isHidden = true
+        usageLabel.setContentHuggingPriority(.required, for: .horizontal)
+        usageLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
         translateLabel.font = .systemFont(ofSize: 10.5, weight: .semibold)
         translateLabel.textColor = NSColor.systemTeal.withAlphaComponent(0.92)
         translateLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -421,7 +432,7 @@ private final class HUDView: NSView {
             label.setContentHuggingPriority(.defaultLow, for: .horizontal)
         }
 
-        [dot, elapsedLabel, waveform, translateLabel, targetIcon, targetLabel, transcriptLabel].forEach(expanded.addSubview)
+        [dot, elapsedLabel, waveform, usageLabel, translateLabel, targetIcon, targetLabel, transcriptLabel].forEach(expanded.addSubview)
         pin(expanded, to: self)
 
         NSLayoutConstraint.activate([
@@ -438,7 +449,9 @@ private final class HUDView: NSView {
             waveform.heightAnchor.constraint(equalToConstant: 14),
             waveform.widthAnchor.constraint(equalToConstant: 92),
 
-            translateLabel.leadingAnchor.constraint(equalTo: waveform.trailingAnchor, constant: 10),
+            usageLabel.leadingAnchor.constraint(equalTo: waveform.trailingAnchor, constant: 10),
+            usageLabel.centerYAnchor.constraint(equalTo: dot.centerYAnchor),
+
             translateLabel.centerYAnchor.constraint(equalTo: dot.centerYAnchor),
             translateLabel.trailingAnchor.constraint(lessThanOrEqualTo: targetIcon.leadingAnchor, constant: -10),
 
@@ -456,6 +469,9 @@ private final class HUDView: NSView {
             transcriptLabel.topAnchor.constraint(greaterThanOrEqualTo: dot.bottomAnchor, constant: 8),
         ])
 
+        translateAfterUsage = translateLabel.leadingAnchor.constraint(equalTo: usageLabel.trailingAnchor, constant: 8)
+        translateAfterWave = translateLabel.leadingAnchor.constraint(equalTo: waveform.trailingAnchor, constant: 10)
+        translateAfterWave.isActive = true
     }
 
     private func pin(_ view: NSView, to parent: NSView) {
@@ -489,6 +505,7 @@ private final class HUDView: NSView {
             stopPulse()
             waveform.reset()
             translateLabel.isHidden = true
+            usageLabel.isHidden = true
             if needsPermission {
                 glyph.contentTintColor = .systemOrange
                 toolTip = "Quill needs Accessibility to use the keyboard trigger — click to fix"
@@ -506,6 +523,7 @@ private final class HUDView: NSView {
             elapsedLabel.isHidden = false
             waveform.isHidden = false
             applyTranslateCaptionVisibility()
+            applyUsageVisibility()
             transcriptLabel.stringValue = "Listening… click where the words should go"
             transcriptLabel.textColor = NSColor.white.withAlphaComponent(0.38)
 
@@ -518,6 +536,7 @@ private final class HUDView: NSView {
             elapsedLabel.stringValue = translateLabel.isHidden ? "Transcribing" : "Translating"
             elapsedLabel.isHidden = false
             applyTranslateCaptionVisibility()
+            applyUsageVisibility()
             if transcriptLabel.stringValue.hasPrefix("Listening") {
                 transcriptLabel.stringValue = ""
             }
@@ -573,6 +592,25 @@ private final class HUDView: NSView {
         guard !isIdle else { return }
         let whole = Int(seconds)
         elapsedLabel.stringValue = String(format: "%d:%02d", whole / 60, whole % 60)
+    }
+
+    func setUsagePercent(_ percent: Int?) {
+        if let percent {
+            usageLabel.stringValue = "\(max(0, min(100, percent)))%"
+            usageLabel.textColor = percent >= 90
+                ? NSColor.systemOrange.withAlphaComponent(0.95)
+                : NSColor.white.withAlphaComponent(0.55)
+        } else {
+            usageLabel.stringValue = ""
+        }
+        applyUsageVisibility()
+    }
+
+    private func applyUsageVisibility() {
+        let show = !usageLabel.stringValue.isEmpty && !isIdle
+        usageLabel.isHidden = !show
+        translateAfterUsage.isActive = show
+        translateAfterWave.isActive = !show
     }
 
     func setTranslateCaption(_ text: String?) {

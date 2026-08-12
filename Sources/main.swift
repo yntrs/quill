@@ -189,6 +189,11 @@ final class QuillApp: NSObject, NSApplicationDelegate {
 
         hotkey.onFirstEvent = { Log.write("event tap is LIVE — first event delivered") }
         hotkey.start()
+        if let token = Auth.current()?.token {
+            GrokUsage.refresh(token: token) { [weak self] percent in
+                self?.hud.update(usagePercent: percent)
+            }
+        }
 
         hud.setNeedsPermission(!isTrusted)
 
@@ -736,6 +741,13 @@ final class QuillApp: NSObject, NSApplicationDelegate {
 
     @objc private func quit() { NSApp.terminate(nil) }
 
+    private func refreshUsage(force: Bool) {
+        guard let token = Auth.current()?.token else { return }
+        GrokUsage.refresh(token: token, force: force) { [weak self] percent in
+            self?.hud.update(usagePercent: percent)
+        }
+    }
+
     // MARK: Session
 
     @objc private func toggle() {
@@ -961,6 +973,7 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         refreshIcon()
         hud.apply(.listening)
         hud.update(translateCaption: Defaults.currentTranslate.hudCaption)
+        refreshUsage(force: false)
         if let selection = capturedSelection {
             hud.flashTarget("replacing \(selection.range.length) selected characters", for: 3)
         }
@@ -1216,6 +1229,7 @@ final class QuillApp: NSObject, NSApplicationDelegate {
             hud.apply(.thinking)
             hud.update(text: trimmed)
             Translator.translate(trimmed, mode: translate, token: creds.token) { [weak self] result in
+                self?.refreshUsage(force: true)
                 self?.completeSession(with: result)
             }
             return
