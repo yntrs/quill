@@ -175,6 +175,7 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
         } else {
             bestText = Self.join(committed, livePartial)
         }
+        bestText = Self.collapseRepeated(bestText)
         let snapshot = bestText
         guard !snapshot.isEmpty else { return }
         DispatchQueue.main.async { [weak self] in self?.onText(snapshot) }
@@ -198,6 +199,20 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
         if alreadyHas(a, b) { return a }
         if b.hasPrefix(a) { return b }
         return join(a, b)
+    }
+
+    /// "hello world hello world" → "hello world"
+    private static func collapseRepeated(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = trimmed.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        guard parts.count >= 2, parts.count % 2 == 0 else { return trimmed }
+        let half = parts.count / 2
+        let left = parts.prefix(half).joined(separator: " ")
+        let right = parts.suffix(half).joined(separator: " ")
+        if left.compare(right, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame {
+            return left
+        }
+        return trimmed
     }
 
     private static func alreadyHas(_ committed: String, _ incoming: String) -> Bool {
@@ -270,7 +285,8 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
         guard !didFinish else { return }
         didFinish = true
         doneTimer?.invalidate()
-        let text = bestText
+        let text = Self.collapseRepeated(bestText)
+        bestText = text
         Log.write("Apple STT complete — \(text.isEmpty ? "EMPTY" : "\(text.count)ch")")
         task = nil
         request = nil

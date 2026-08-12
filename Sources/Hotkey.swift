@@ -261,6 +261,9 @@ final class DoubleTapRightCommand {
             return false
         }
 
+        // Globe/fn is handled only as keyDown/keyUp. flagsChanged for the same
+        // press used to look like a second tap and immediately stop recording.
+        guard trigger != .fnGlobe else { return false }
         guard type == .flagsChanged, let spec = trigger.modifier else { return false }
 
         let code = event.getIntegerValueField(.keyboardEventKeycode)
@@ -335,15 +338,18 @@ final class DoubleTapRightCommand {
     /// A completed bare tap. If `reportDoubleTap` is on, wait to see whether a
     /// second tap follows; otherwise fire immediately as today.
     private var lastNoteAt: CFTimeInterval = 0
+    private var ignoreTapsUntil: CFTimeInterval = 0
     private func noteTap() {
         let now = CACurrentMediaTime()
-        // flagsChanged + keyUp can both fire for one physical fn press.
-        if now - lastNoteAt < 0.09 { return }
+        if now < ignoreTapsUntil { return }
+        // Duplicate delivery of the same physical press (keyUp + flagsChanged).
+        if now - lastNoteAt < 0.14 { return }
         lastNoteAt = now
         guard reportDoubleTap else {
             lastTapAt = 0
             pendingSingle?.cancel()
             pendingSingle = nil
+            ignoreTapsUntil = now + 0.55
             DispatchQueue.main.async { [weak self] in self?.onTrigger() }
             return
         }
@@ -351,6 +357,7 @@ final class DoubleTapRightCommand {
             lastTapAt = 0
             pendingSingle?.cancel()
             pendingSingle = nil
+            ignoreTapsUntil = now + 0.55
             DispatchQueue.main.async { [weak self] in self?.onDoubleTrigger() }
             return
         }
@@ -360,6 +367,7 @@ final class DoubleTapRightCommand {
             guard let self else { return }
             self.lastTapAt = 0
             self.pendingSingle = nil
+            self.ignoreTapsUntil = CACurrentMediaTime() + 0.55
             self.onTrigger()
         }
         pendingSingle = work
