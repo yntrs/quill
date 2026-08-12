@@ -70,6 +70,13 @@ final class STTClient: NSObject, URLSessionWebSocketDelegate {
         if !language.isEmpty, language != "auto" {
             items.append(.init(name: "language", value: language))
         }
+        // Bias the recognizer toward common Greek vocabulary / proper nouns that
+        // English-centric STT often mangles. keyterm may be repeated (max 100).
+        if language == "el" || language == "auto" {
+            for term in Self.greekKeyterms {
+                items.append(.init(name: "keyterm", value: term))
+            }
+        }
         components.queryItems = items
 
         var request = URLRequest(url: components.url!)
@@ -85,6 +92,17 @@ final class STTClient: NSObject, URLSessionWebSocketDelegate {
         socket.resume()
         receive()
     }
+
+    /// Short Greek bias terms for streaming STT (each ≤ 50 chars, total ≤ 100).
+    private static let greekKeyterms: [String] = [
+        "και", "είναι", "αυτό", "αυτή", "αυτά", "για", "από", "στο", "στη", "στην",
+        "τον", "την", "των", "ένα", "μια", "ότι", "όπως", "επίσης", "τώρα", "μετά",
+        "παρακαλώ", "ευχαριστώ", "γεια", "καλημέρα", "καλησπέρα", "καληνύχτα",
+        "θέλω", "μπορώ", "πρέπει", "κάνω", "λέω", "γράφω", "στέλνω", "άνοιξε",
+        "κλείσε", "τελείωσα", "φτάνει", "τέλος", "μήνυμα", "email", "τηλέφωνο",
+        "συνάντηση", "αύριο", "σήμερα", "χθες", "Ελλάδα", "Αθήνα", "Θεσσαλονίκη",
+        "Grok", "Quill", "Mac", "iPhone", "WhatsApp",
+    ]
 
     func send(pcm: Data) {
         task?.send(.data(pcm)) { _ in }

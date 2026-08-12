@@ -7,12 +7,16 @@ import ApplicationServices
 /// "open Grok, now write me a haiku" must open Grok and type only the haiku.
 enum VoiceCommands {
 
-    /// "open grok" / "open grok build", allowing for how speech-to-text actually
-    /// hears the word — grock, grog, croc and friends all turn up in practice.
+    /// "open grok" / "open grok build", plus Greek "άνοιξε grok", allowing for how
+    /// speech-to-text actually hears the word — grock, grog, croc and friends.
     private static let openGrok: NSRegularExpression = {
         let word = "gro(?:k|ck|g|c)|crock|croc|grokk"
-        let pattern = "(?:^|\\s)(?:please\\s+)?(?:open|launch|start)\\s+(?:up\\s+)?(?:the\\s+)?"
-                    + "(?:\(word))(?:\\s+build)?\\b[\\s,.!?]*"
+        let english = "(?:please\\s+)?(?:open|launch|start)\\s+(?:up\\s+)?(?:the\\s+)?"
+                    + "(?:\(word))(?:\\s+build)?"
+        // άνοιξε / άνοιξε μου / άνοιξε το grok (build)
+        let greek = "(?:άνοιξε|ανοιξε|άνοιξε μου|ανοιξε μου)\\s+(?:το\\s+|την\\s+)?"
+                  + "(?:\(word))(?:\\s+build)?"
+        let pattern = "(?:^|\\s)(?:\(english)|\(greek))\\b[\\s,.!?;:·]*"
         return try! NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
     }()
 
@@ -21,14 +25,18 @@ enum VoiceCommands {
         return openGrok.firstMatch(in: text, range: range) != nil
     }
 
-    /// "that's it" or "that's all" — but only as the very last thing said.
+    /// "that's it" / "that's all", plus Greek finish phrases — only as the last thing said.
     ///
     /// Anchored to the end on purpose. The phrase is ordinary English in the middle
     /// of a sentence ("that's it exactly"), and stopping there would cut someone off
     /// mid-thought. Matching only a trailing occurrence, and only after a short
     /// silence, is what makes it safe to have on by default.
     private static let stopPhrase: NSRegularExpression = {
-        let pattern = "(?:^|\\s)(?:and\\s+)?that(?:'|’)?s\\s+(?:it|all)\\b[\\s,.!?]*$"
+        let english = "(?:and\\s+)?that(?:'|’)?s\\s+(?:it|all)"
+        // τελείωσα / αυτά / αυτό είναι / φτάνει / τέλος / αρκετά
+        let greek = "(?:και\\s+)?(?:τελείωσα|τελειωσα|αυτά|αυτα|αυτό είναι|αυτο ειναι|"
+                  + "φτάνει|φτανει|τέλος|τελος|αρκετά|αρκετα)"
+        let pattern = "(?:^|\\s)(?:\(english)|\(greek))\\b[\\s,.!?;:·]*$"
         return try! NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
     }()
 
@@ -37,7 +45,7 @@ enum VoiceCommands {
         return stopPhrase.firstMatch(in: text, range: range) != nil
     }
 
-    /// Removes a trailing "that's it" so the words that ended the dictation are not
+    /// Removes a trailing finish phrase so the words that ended the dictation are not
     /// part of what gets pasted.
     static func stripStopPhrase(_ text: String) -> String {
         let range = NSRange(text.startIndex..., in: text)

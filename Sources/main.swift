@@ -29,9 +29,13 @@ enum Defaults {
     static let availableUpdateURL = "availableUpdateURL"
     static let notifiedUpdateVersion = "notifiedUpdateVersion"
 
+    /// One-shot flag so we can default this personal build to Greek without
+    /// overriding a language the user later picks themselves.
+    static let greekDefaultApplied = "greekDefaultApplied"
+
     static func register() {
         UserDefaults.standard.register(defaults: [
-            language: "en",
+            language: "el",
             cornerButton: true,
             insertAtEnd: true,
             clickToInsert: true,
@@ -39,10 +43,18 @@ enum Defaults {
             singleTap: true,
             stopPhrase: true,
             pauseSeconds: 5.0,
-            polish: false,
+            // Greek STT often misses accents / small slips — polish cleans those up.
+            polish: true,
             keepHistory: true,
             notifyUpdates: true,
         ])
+        // Existing installs already have the old English registration; force Greek
+        // once so "understand Greek well" is the default without fighting later choices.
+        if !UserDefaults.standard.bool(forKey: greekDefaultApplied) {
+            UserDefaults.standard.set("el", forKey: language)
+            UserDefaults.standard.set(true, forKey: polish)
+            UserDefaults.standard.set(true, forKey: greekDefaultApplied)
+        }
     }
 
     static func bool(_ key: String) -> Bool { UserDefaults.standard.bool(forKey: key) }
@@ -102,15 +114,18 @@ final class QuillApp: NSObject, NSApplicationDelegate {
     private var selfTestTimer: Timer?
     private let setup = SetupWindow()
 
-    /// Grok STT's own list, plus Chinese.
+    /// Grok STT's own list, plus Chinese and Greek.
     ///
     /// Chinese is absent from the language table inside the grok CLI, but the
     /// service transcribes it correctly — verified against the live endpoint with
     /// `language=zh`, with the parameter omitted, and even with `language=en`.
     /// The underlying model is evidently multilingual and that table is a UI
     /// subset, so leaving Chinese out would have been an artificial limit.
+    /// Greek (`el`) is not in xAI's official STT formatting table either, but
+    /// the streaming endpoint accepts the code and biases recognition toward it.
     private let languages: [(String, String)] = [
         ("Auto-detect", "auto"),
+        ("Greek", "el"),
         ("English", "en"),
         ("Arabic", "ar"), ("Chinese", "zh"), ("Czech", "cs"), ("Danish", "da"),
         ("Dutch", "nl"), ("Filipino", "fil"), ("French", "fr"), ("German", "de"),
@@ -406,14 +421,15 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         menu.setSubmenu(triggerMenu, for: triggerItem)
 
         let languageMenu = NSMenu()
-        let current = UserDefaults.standard.string(forKey: Defaults.language) ?? "en"
+        let current = UserDefaults.standard.string(forKey: Defaults.language) ?? "el"
         for (index, entry) in languages.enumerated() {
             let item = NSMenuItem(title: entry.0, action: #selector(setLanguage(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = entry.1
             item.state = (entry.1 == current) ? .on : .off
             languageMenu.addItem(item)
-            if index == 1 { languageMenu.addItem(.separator()) }
+            // Separator after the primary picks: Auto, Greek, English.
+            if index == 2 { languageMenu.addItem(.separator()) }
         }
         let languageItem = NSMenuItem(title: "Language", action: nil, keyEquivalent: "")
         menu.addItem(languageItem)
@@ -698,8 +714,8 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         // between this feeling instant and feeling like a wait.
         if Defaults.bool(Defaults.polish) { Polisher.warm(token: creds.token) }
 
-        client.connect(token: creds.token,
-                       language: UserDefaults.standard.string(forKey: Defaults.language) ?? "en")
+        let language = UserDefaults.standard.string(forKey: Defaults.language) ?? "el"
+        client.connect(token: creds.token, language: language)
 
         recorder.onPCM = { [weak self] data in
             guard let self else { return }
@@ -981,7 +997,8 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         // Show the raw words while the cleanup runs, so nothing appears to stall.
         hud.apply(.thinking)
         hud.update(text: trimmed)
-        Polisher.polish(trimmed, token: creds.token) { [weak self] result in
+        let language = UserDefaults.standard.string(forKey: Defaults.language) ?? "el"
+        Polisher.polish(trimmed, token: creds.token, language: language) { [weak self] result in
             self?.completeSession(with: result)
         }
     }
