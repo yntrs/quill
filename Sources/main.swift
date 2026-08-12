@@ -675,29 +675,46 @@ final class QuillApp: NSObject, NSApplicationDelegate {
             return
         }
 
-        guard let creds = Auth.current() else {
+        guard Auth.current() != nil else {
             hud.apply(.notice("No Grok Build session found — run `grok` once to sign in"))
             hud.collapse(after: 4)
             return
         }
 
-        let client = STTClient()
-        wireTranscriber(client, creds: creds, language: language)
-
         if let selfTestPath {
+            let client = STTClient()
+            wireTranscriber(client, creds: Auth.current(), language: language)
             startSelfTest(path: selfTestPath, client: client)
             return
         }
 
-        startMicAndRecord()
+        startGrokCapture(language: language)
     }
 
-    /// Apple el-GR path — needs Speech permission, not a Grok token.
+    /// Apple el-GR path — needs Speech permission + system Dictation enabled.
     private func startAppleGreekCapture() {
         let start: () -> Void = { [weak self] in
             guard let self else { return }
             let client = AppleSTTClient()
-            self.wireTranscriber(client, creds: Auth.current(), language: "el")
+            self.wireTranscriber(client, creds: Auth.current(), language: "el",
+                                 onEngineFailure: { [weak self] message in
+                guard let self else { return }
+                // Dictation off → open Settings and fall back to Grok so the user
+                // is not stuck with a dead hotkey.
+                if AppleSTTClient.isDictationDisabledError(message) {
+                    AppleSTTClient.openDictationSettings()
+                    self.hud.apply(.notice(message))
+                    self.hud.collapse(after: 6)
+                    if Auth.current() != nil {
+                        Log.write("Apple STT blocked by Dictation off — falling back to Grok STT")
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                            self.startGrokCapture(language: "el")
+                        }
+                    }
+                    return
+                }
+                self.abortSession(message: message)
+            })
             client.connect(language: "el")
             self.startMicAndRecord()
         }
@@ -722,9 +739,21 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func startGrokCapture(language: String) {
+        guard let creds = Auth.current() else {
+            hud.apply(.notice("No Grok Build session found — run `grok` once to sign in"))
+            hud.collapse(after: 4)
+            return
+        }
+        let client = STTClient()
+        wireTranscriber(client, creds: creds, language: language)
+        startMicAndRecord()
+    }
+
     private func wireTranscriber(_ client: StreamingTranscriber,
                                  creds: Auth.Creds?,
-                                 language: String) {
+                                 language: String,
+                                 onEngineFailure: ((String) -> Void)? = nil) {
         stt = client
         pendingPCM = []
         socketReady = false
@@ -757,7 +786,20 @@ final class QuillApp: NSObject, NSApplicationDelegate {
             self.hud.update(text: VoiceCommands.stripAll(text))
         }
         client.onComplete = { [weak self] text in self?.finishSession(with: text) }
-        client.onFailure = { [weak self] message in self?.abortSession(message: message) }
+        client.onFailure = { [weak self] message in
+            if let onEngineFailure {
+                // Tear down the failed engine before optional fallback.
+                self?.recorder.stop()
+                self?.stt?.cancel()
+                self?.stt = nil
+                self?.isRecording = false
+                self?.invalidateTimers()
+                self?.refreshIcon()
+                onEngineFailure(message)
+            } else {
+                self?.abortSession(message: message)
+            }
+        }
 
         if Defaults.bool(Defaults.polish), let token = creds?.token {
             Polisher.warm(token: token)

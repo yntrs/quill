@@ -1,3 +1,4 @@
+import AppKit
 import AVFoundation
 import Foundation
 import Speech
@@ -102,8 +103,10 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
                     self.complete()
                     return
                 }
+                let message = Self.friendlyMessage(for: error)
+                Log.write("Apple STT error: \(ns.domain) code=\(ns.code) — \(error.localizedDescription)")
                 DispatchQueue.main.async {
-                    self.onFailure(error.localizedDescription)
+                    self.onFailure(message)
                 }
             }
         }
@@ -159,5 +162,40 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
         task = nil
         request = nil
         DispatchQueue.main.async { [weak self] in self?.onComplete(text) }
+    }
+
+    /// macOS returns a terse system string; map the common case to something actionable.
+    private static func friendlyMessage(for error: Error) -> String {
+        let text = error.localizedDescription
+        let lower = text.lowercased()
+        if lower.contains("siri") && lower.contains("dictation") {
+            return Self.dictationDisabledMessage
+        }
+        if lower.contains("not authorized") || lower.contains("not authorised") {
+            return "Speech Recognition permission denied — enable Quill in Privacy & Security ▸ Speech Recognition"
+        }
+        return text
+    }
+
+    static let dictationDisabledMessage =
+        "Turn on Dictation in System Settings ▸ Keyboard ▸ Dictation (Apple Greek needs it)"
+
+    static func openDictationSettings() {
+        // macOS Sequoia / Tahoe Keyboard settings; fall back to classic Speech pane.
+        let candidates = [
+            "x-apple.systempreferences:com.apple.Keyboard-Settings.extension?Dictation",
+            "x-apple.systempreferences:com.apple.Siri-Settings.extension",
+            "x-apple.systempreferences:com.apple.preference.keyboard?Dictation",
+            "x-apple.systempreferences:com.apple.preference.speech",
+        ]
+        for urlString in candidates {
+            if let url = URL(string: urlString), NSWorkspace.shared.open(url) { return }
+        }
+    }
+
+    /// True when the failure means Apple Speech cannot run until the user flips a system switch.
+    static func isDictationDisabledError(_ message: String) -> Bool {
+        let lower = message.lowercased()
+        return lower.contains("dictation") && (lower.contains("disabled") || lower.contains("turn on"))
     }
 }
