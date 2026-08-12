@@ -64,7 +64,10 @@ final class DoubleTapRightCommand {
 
     private let window: CFTimeInterval = 0.42
     private static let f5KeyCode: Int64 = 96
-    private static let modifierKeyCodes: Set<Int64> = [54, 55, 56, 57, 58, 59, 60, 61, 62, 63]
+    /// 63 = Fn. 179 = Globe on some keyboards. Both must count as the trigger,
+    /// not as "another key" that cancels a tap.
+    private static let fnKeyCodes: Set<Int64> = [63, 179]
+    private static let modifierKeyCodes: Set<Int64> = [54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 179]
 
     private var tap: CFMachPort?
     private var lastTapAt: CFTimeInterval = 0
@@ -159,6 +162,7 @@ final class DoubleTapRightCommand {
 
         let mask = CGEventMask(1 << CGEventType.flagsChanged.rawValue)
                  | CGEventMask(1 << CGEventType.keyDown.rawValue)
+                 | CGEventMask(1 << CGEventType.keyUp.rawValue)
                  | CGEventMask(1 << CGEventType.leftMouseDown.rawValue)
 
         let refcon = Unmanaged.passUnretained(self).toOpaque()
@@ -217,12 +221,12 @@ final class DoubleTapRightCommand {
             return false
         }
 
-        if type == .keyDown {
+        if type == .keyDown || type == .keyUp {
             let code = event.getIntegerValueField(.keyboardEventKeycode)
 
             // Only meaningful when Input Monitoring happens to be granted; the
             // keyState poll above covers everyone else.
-            if code == Self.escapeKeyCode, cancelTimer != nil, !escapeWasDown {
+            if type == .keyDown, code == Self.escapeKeyCode, cancelTimer != nil, !escapeWasDown {
                 escapeWasDown = true
                 DispatchQueue.main.async { [weak self] in self?.onCancel() }
                 return false
@@ -231,17 +235,29 @@ final class DoubleTapRightCommand {
                 .intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift])
                 .isEmpty
 
-            if trigger == .f5, code == Self.f5KeyCode, bareKey {
-                DispatchQueue.main.async { [weak self] in self?.noteTap() }
+            if trigger == .f5, type == .keyDown, code == Self.f5KeyCode, bareKey {
+                noteTap()
                 // Swallowed so macOS dictation does not also fire on the same press.
                 return true
             }
+
+            // Globe/fn often arrives as keyDown/keyUp (not only flagsChanged).
+            // Treating that as "another key" used to cancel the tap and broke
+            // Translate ▸ double-tap when the trigger was 🌐.
+            if trigger == .fnGlobe, Self.fnKeyCodes.contains(code) {
+                handleFnKey(type)
+                return true
+            }
+
+            if type == .keyUp { return false }
 
             // A real keystroke means the modifier press was part of a shortcut
             // (⌘C, ⌥→ …), not a bare tap. Invalidate.
             if debugKeys { Log.write("    [keys] keyDown code=\(code) → invalidating tap") }
             sawKeyDownSinceTap = true
             lastTapAt = 0
+            pendingSingle?.cancel()
+            pendingSingle = nil
             return false
         }
 
@@ -290,17 +306,40 @@ final class DoubleTapRightCommand {
                 + "activity \(activityAtPress)→\(activityNow) held=\(String(format: "%.2f", now - pressedAt))")
         }
 
-        if singleTap, pressedAt > 0, !sawKeyDownSinceTap, !didSomethingElse, now - pressedAt < tapMaxHold {
+        let ignoreActivity = trigger == .fnGlobe
+        if singleTap, pressedAt > 0, !sawKeyDownSinceTap,
+           (ignoreActivity || !didSomethingElse), now - pressedAt < tapMaxHold {
             pressedAt = 0
             noteTap()
         }
         return false
     }
 
+    private func handleFnKey(_ type: CGEventType) {
+        let now = CACurrentMediaTime()
+        if type == .keyDown {
+            pressedAt = now
+            activityAtPress = Self.activityCounter()
+            sawKeyDownSinceTap = false
+            return
+        }
+        guard type == .keyUp, pressedAt > 0 else { return }
+        let held = now - pressedAt
+        pressedAt = 0
+        // Globe's own keyDown bumps the activity counter, so a "did anything
+        // else happen?" check always looks like a chord. Time-only is enough.
+        guard held < tapMaxHold else { return }
+        noteTap()
+    }
+
     /// A completed bare tap. If `reportDoubleTap` is on, wait to see whether a
     /// second tap follows; otherwise fire immediately as today.
+    private var lastNoteAt: CFTimeInterval = 0
     private func noteTap() {
         let now = CACurrentMediaTime()
+        // flagsChanged + keyUp can both fire for one physical fn press.
+        if now - lastNoteAt < 0.09 { return }
+        lastNoteAt = now
         guard reportDoubleTap else {
             lastTapAt = 0
             pendingSingle?.cancel()

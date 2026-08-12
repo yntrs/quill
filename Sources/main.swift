@@ -626,6 +626,7 @@ final class QuillApp: NSObject, NSApplicationDelegate {
             task.launchPath = "/usr/bin/defaults"
             task.arguments = ["write", "com.apple.HIToolbox", "AppleFnUsageType", "-int", "0"]
             try? task.run()
+            applyTapMode()
         }
 
         hud.apply(.notice("Trigger: \(option.gesture(singleTap: Defaults.bool(Defaults.singleTap)))"))
