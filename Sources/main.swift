@@ -1085,7 +1085,8 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         // Show the raw words while the cleanup runs, so nothing appears to stall.
         hud.apply(.thinking)
         hud.update(text: trimmed)
-        let language = UserDefaults.standard.string(forKey: Defaults.language) ?? "el"
+        let setting = UserDefaults.standard.string(forKey: Defaults.language) ?? "el"
+        let language = Polisher.effectiveLanguage(setting: setting, text: trimmed)
         Polisher.polish(trimmed, token: creds.token, language: language) { [weak self] result in
             self?.completeSession(with: result)
         }

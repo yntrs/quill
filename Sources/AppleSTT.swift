@@ -68,6 +68,9 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
 
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
+        // Bias common English words a Greek speaker inserts mid-sentence.
+        // Without this, el-GR often writes them in Greek letters (κροκ, μακούς…).
+        request.contextualStrings = Self.englishContextHints
         // On-device is faster, private, and usually better for Greek when installed.
         if recognizer.supportsOnDeviceRecognition {
             request.requiresOnDeviceRecognition = true
@@ -198,4 +201,13 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
         let lower = message.lowercased()
         return lower.contains("dictation") && (lower.contains("disabled") || lower.contains("turn on"))
     }
+
+    /// English / tech terms Greek dictation often mangles — kept short for the API cap.
+    private static let englishContextHints: [String] = [
+        "hey", "Grok", "Grok Build", "Quill", "Mac", "macOS", "MacBook", "iPhone", "iPad",
+        "iOS", "Swift", "Xcode", "GitHub", "Google", "WhatsApp", "email", "Slack", "Zoom",
+        "Control", "Command", "Option", "Escape", "Terminal", "Finder", "Safari", "Chrome",
+        "API", "JSON", "Python", "JavaScript", "TypeScript", "Docker", "OpenAI", "Claude",
+        "Windows", "Linux", "Bluetooth", "Wi‑Fi", "USB", "PDF", "URL", "password", "login",
+    ]
 }
