@@ -124,7 +124,7 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
                 // Mid-dictation pause: Apple ends the *utterance*, not the session.
                 // Commit what we have and keep listening on a fresh task.
                 if !self.livePartial.isEmpty {
-                    self.committed = Self.join(self.committed, self.livePartial)
+                    self.committed = Self.merge(self.committed, self.livePartial)
                     self.livePartial = ""
                     self.publish()
                 }
@@ -141,7 +141,7 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
 
         if result.isFinal {
             if !text.isEmpty {
-                committed = Self.join(committed, text)
+                committed = Self.merge(committed, text)
             }
             livePartial = ""
             publish()
@@ -151,14 +151,30 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
         guard !text.isEmpty else { return }
 
         if !livePartial.isEmpty, !Self.isContinuation(old: livePartial, new: text) {
-            committed = Self.join(committed, livePartial)
+            committed = Self.merge(committed, livePartial)
         }
-        livePartial = text
+        // Don't keep a live tail that is already the end of committed
+        // (finish() or isFinal already stored it).
+        if Self.alreadyHas(committed, text) {
+            livePartial = ""
+        } else {
+            livePartial = text
+        }
         publish()
     }
 
     private func publish() {
-        bestText = Self.join(committed, livePartial)
+        if livePartial.isEmpty {
+            bestText = committed
+        } else if Self.alreadyHas(committed, livePartial) {
+            bestText = committed
+        } else if committed.isEmpty {
+            bestText = livePartial
+        } else if livePartial.hasPrefix(committed) {
+            bestText = livePartial
+        } else {
+            bestText = Self.join(committed, livePartial)
+        }
         let snapshot = bestText
         guard !snapshot.isEmpty else { return }
         DispatchQueue.main.async { [weak self] in self?.onText(snapshot) }
@@ -171,9 +187,36 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
         return a + " " + b
     }
 
+    /// Append `incoming` only if it is actually new. Apple often re-sends the
+    /// same utterance as isFinal after we already committed the live partial —
+    /// that was producing "grok grok" → "grok grok grok grok".
+    private static func merge(_ committed: String, _ incoming: String) -> String {
+        let a = committed.trimmingCharacters(in: .whitespacesAndNewlines)
+        let b = incoming.trimmingCharacters(in: .whitespacesAndNewlines)
+        if a.isEmpty { return b }
+        if b.isEmpty { return a }
+        if alreadyHas(a, b) { return a }
+        if b.hasPrefix(a) { return b }
+        return join(a, b)
+    }
+
+    private static func alreadyHas(_ committed: String, _ incoming: String) -> Bool {
+        let a = committed.trimmingCharacters(in: .whitespacesAndNewlines)
+        let b = incoming.trimmingCharacters(in: .whitespacesAndNewlines)
+        if a.isEmpty || b.isEmpty { return false }
+        if a == b { return true }
+        if a.hasSuffix(b) { return true }
+        // Case-insensitive suffix for "Grok" vs "grok"
+        let al = a.lowercased()
+        let bl = b.lowercased()
+        return al == bl || al.hasSuffix(bl)
+    }
+
     /// Same utterance growing/revising vs a brand-new sentence after a pause.
     private static func isContinuation(old: String, new: String) -> Bool {
         if new.hasPrefix(old) || old.hasPrefix(new) { return true }
+        let ol = old.lowercased(), nl = new.lowercased()
+        if nl.hasPrefix(ol) || ol.hasPrefix(nl) { return true }
         let n = min(old.count, new.count, 20)
         return n >= 8 && old.prefix(n) == new.prefix(n)
     }
@@ -199,7 +242,7 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
         guard !didFinish else { return }
         finishRequested = true
         if !livePartial.isEmpty {
-            committed = Self.join(committed, livePartial)
+            committed = Self.merge(committed, livePartial)
             livePartial = ""
             publish()
         }
