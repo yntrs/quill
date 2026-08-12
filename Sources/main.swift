@@ -885,6 +885,7 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         startedAt = Date()
         refreshIcon()
         hud.apply(.listening)
+        hud.update(translateCaption: Defaults.currentTranslate.hudCaption)
         if let selection = capturedSelection {
             hud.flashTarget("replacing \(selection.range.length) selected characters", for: 3)
         }

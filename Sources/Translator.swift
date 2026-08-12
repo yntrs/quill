@@ -34,6 +34,15 @@ enum TranslateMode: String, CaseIterable {
         case .enToEl: return "Speak English → insert Greek"
         }
     }
+
+    /// Shown in the session bar next to the waveform while you talk.
+    var hudCaption: String? {
+        switch self {
+        case .off:    return nil
+        case .elToEn: return "Greek → English"
+        case .enToEl: return "English → Greek"
+        }
+    }
 }
 
 enum Translator {

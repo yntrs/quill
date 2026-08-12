@@ -23,7 +23,7 @@ final class HUD {
     private var targetOverrideUntil: Date?
 
     private let compactSize = NSSize(width: 30, height: 30)
-    private let expandedSize = NSSize(width: 396, height: 68)
+    private let expandedSize = NSSize(width: 448, height: 68)
     private let margin: CGFloat = 14
 
 
@@ -126,6 +126,7 @@ final class HUD {
     func update(text: String)      { content.setTranscript(text) }
     func update(level: Float)      { content.setLevel(level) }
     func update(elapsed: TimeInterval) { content.setElapsed(elapsed) }
+    func update(translateCaption: String?) { content.setTranslateCaption(translateCaption) }
     func update(target app: String?, icon: NSImage?) {
         guard Date() >= (targetOverrideUntil ?? .distantPast) else { return }
         content.setTarget(app, icon: icon)
@@ -304,6 +305,7 @@ private final class HUDView: NSView {
     private let dot = NSView()
     private let elapsedLabel = NSTextField(labelWithString: "0:00")
     private let waveform = WaveformView()
+    private let translateLabel = NSTextField(labelWithString: "")
     private let targetLabel = NSTextField(labelWithString: "")
     private let targetIcon = NSImageView()
     private let transcriptLabel = NSTextField(labelWithString: "")
@@ -387,6 +389,13 @@ private final class HUDView: NSView {
 
         waveform.translatesAutoresizingMaskIntoConstraints = false
 
+        translateLabel.font = .systemFont(ofSize: 10.5, weight: .semibold)
+        translateLabel.textColor = NSColor.systemTeal.withAlphaComponent(0.92)
+        translateLabel.translatesAutoresizingMaskIntoConstraints = false
+        translateLabel.isHidden = true
+        translateLabel.setContentHuggingPriority(.required, for: .horizontal)
+        translateLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
         targetLabel.font = .systemFont(ofSize: 11, weight: .medium)
         targetLabel.textColor = NSColor.white.withAlphaComponent(0.48)
         targetLabel.alignment = .right
@@ -412,7 +421,7 @@ private final class HUDView: NSView {
             label.setContentHuggingPriority(.defaultLow, for: .horizontal)
         }
 
-        [dot, elapsedLabel, waveform, targetIcon, targetLabel, transcriptLabel].forEach(expanded.addSubview)
+        [dot, elapsedLabel, waveform, translateLabel, targetIcon, targetLabel, transcriptLabel].forEach(expanded.addSubview)
         pin(expanded, to: self)
 
         NSLayoutConstraint.activate([
@@ -427,8 +436,11 @@ private final class HUDView: NSView {
             waveform.leadingAnchor.constraint(equalTo: elapsedLabel.trailingAnchor, constant: 12),
             waveform.centerYAnchor.constraint(equalTo: dot.centerYAnchor),
             waveform.heightAnchor.constraint(equalToConstant: 14),
-            waveform.trailingAnchor.constraint(lessThanOrEqualTo: targetIcon.leadingAnchor, constant: -12),
-            waveform.widthAnchor.constraint(equalToConstant: 130),
+            waveform.widthAnchor.constraint(equalToConstant: 92),
+
+            translateLabel.leadingAnchor.constraint(equalTo: waveform.trailingAnchor, constant: 10),
+            translateLabel.centerYAnchor.constraint(equalTo: dot.centerYAnchor),
+            translateLabel.trailingAnchor.constraint(lessThanOrEqualTo: targetIcon.leadingAnchor, constant: -10),
 
             targetLabel.trailingAnchor.constraint(equalTo: expanded.trailingAnchor, constant: -16),
             targetLabel.centerYAnchor.constraint(equalTo: dot.centerYAnchor),
@@ -476,6 +488,7 @@ private final class HUDView: NSView {
             expanded.isHidden = true
             stopPulse()
             waveform.reset()
+            translateLabel.isHidden = true
             if needsPermission {
                 glyph.contentTintColor = .systemOrange
                 toolTip = "Quill needs Accessibility to use the keyboard trigger — click to fix"
@@ -492,6 +505,7 @@ private final class HUDView: NSView {
             elapsedLabel.stringValue = "0:00"
             elapsedLabel.isHidden = false
             waveform.isHidden = false
+            applyTranslateCaptionVisibility()
             transcriptLabel.stringValue = "Listening… click where the words should go"
             transcriptLabel.textColor = NSColor.white.withAlphaComponent(0.38)
 
@@ -501,8 +515,9 @@ private final class HUDView: NSView {
             stopPulse()
             waveform.isHidden = true
             elapsedLabel.font = .systemFont(ofSize: 11, weight: .semibold)
-            elapsedLabel.stringValue = "Transcribing"
+            elapsedLabel.stringValue = translateLabel.isHidden ? "Transcribing" : "Translating"
             elapsedLabel.isHidden = false
+            applyTranslateCaptionVisibility()
             if transcriptLabel.stringValue.hasPrefix("Listening") {
                 transcriptLabel.stringValue = ""
             }
@@ -558,6 +573,16 @@ private final class HUDView: NSView {
         guard !isIdle else { return }
         let whole = Int(seconds)
         elapsedLabel.stringValue = String(format: "%d:%02d", whole / 60, whole % 60)
+    }
+
+    func setTranslateCaption(_ text: String?) {
+        let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        translateLabel.stringValue = trimmed
+        applyTranslateCaptionVisibility()
+    }
+
+    private func applyTranslateCaptionVisibility() {
+        translateLabel.isHidden = translateLabel.stringValue.isEmpty || isIdle
     }
 
     func setTarget(_ app: String?, icon: NSImage?) {
