@@ -17,6 +17,7 @@ enum Defaults {
     static let cornerButton = "cornerButton"
     static let insertAtEnd = "insertAtEnd"
     static let clickToInsert = "clickToInsert"
+    static let requireTextField = "requireTextField"
     static let trigger = "trigger"
     static let singleTap = "singleTap"
     static let didShowSetup = "didShowSetup"
@@ -43,6 +44,7 @@ enum Defaults {
             cornerButton: true,
             insertAtEnd: true,
             clickToInsert: true,
+            requireTextField: true,
             trigger: Trigger.control.rawValue,
             singleTap: true,
             stopPhrase: true,
@@ -383,6 +385,8 @@ final class QuillApp: NSObject, NSApplicationDelegate {
 
         addToggle(to: menu, title: "Click anywhere to insert", key: Defaults.clickToInsert,
                   action: #selector(toggleClickToInsert))
+        addToggle(to: menu, title: "Require a focused text field", key: Defaults.requireTextField,
+                  action: #selector(toggleRequireTextField))
         addToggle(to: menu, title: "Insert at end of field", key: Defaults.insertAtEnd,
                   action: #selector(toggleInsertAtEnd))
         addToggle(to: menu, title: "Clean up grammar", key: Defaults.polish,
@@ -614,6 +618,16 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         hud.collapse(after: 2.5)
     }
     @objc private func toggleClickToInsert() { Defaults.flip(Defaults.clickToInsert) }
+
+    @objc private func toggleRequireTextField() {
+        Defaults.flip(Defaults.requireTextField)
+        let on = Defaults.bool(Defaults.requireTextField)
+        Log.write("requireTextField = \(on)")
+        hud.apply(.notice(on
+            ? "Won't start unless a text field is focused"
+            : "Will start even with no text field"))
+        hud.collapse(after: 3)
+    }
     @objc private func toggleLoginItem()     { LoginItem.setEnabled(!LoginItem.isEnabled) }
 
     @objc private func setTrigger(_ sender: NSMenuItem) {
@@ -765,6 +779,21 @@ final class QuillApp: NSObject, NSApplicationDelegate {
 
     private func startSession() {
         guard !isRecording else { return }
+
+        if selfTestPath == nil, Defaults.bool(Defaults.requireTextField) {
+            if !Inserter.isTrusted {
+                hud.apply(.notice("Turn on Accessibility so Quill can see the cursor"))
+                hud.collapse(after: 4)
+                setup.show()
+                return
+            }
+            if !Inserter.hasInsertableFocus() {
+                Log.write("blocked start — no insertable focus (\(Inserter.describeFocus()))")
+                hud.apply(.notice("No cursor in a text field — click where you want to type, then try again"))
+                hud.collapse(after: 4)
+                return
+            }
+        }
 
         // Grab the highlighted text now — clicking a destination later would
         // destroy it, and this is the only moment it is reliably present.

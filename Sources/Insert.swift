@@ -106,6 +106,39 @@ enum Inserter {
 
     /// What the focused element actually looks like — the only way to tell why a
     /// write silently goes nowhere.
+    /// True when the focused UI element looks like it can receive typed text.
+    /// Finder groups, buttons, and empty desktop focus return false — that's when
+    /// dictation would run and then land nowhere.
+    static func hasInsertableFocus() -> Bool {
+        guard isTrusted, let element = focusedElement() else { return false }
+
+        var roleRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef)
+        let role = (roleRef as? String) ?? ""
+
+        var subRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &subRef)
+        let sub = (subRef as? String) ?? ""
+
+        let textRoles: Set<String> = [
+            kAXTextFieldRole as String,
+            kAXTextAreaRole as String,
+            kAXComboBoxRole as String,
+            "AXSearchField",
+            "AXTextView",
+        ]
+        if textRoles.contains(role) { return true }
+        if role.contains("Text") || sub.contains("Search") { return true }
+
+        var selText: DarwinBoolean = false
+        AXUIElementIsAttributeSettable(element, kAXSelectedTextAttribute as CFString, &selText)
+        var selRange: DarwinBoolean = false
+        AXUIElementIsAttributeSettable(element, kAXSelectedTextRangeAttribute as CFString, &selRange)
+        if selText.boolValue || selRange.boolValue { return true }
+
+        return false
+    }
+
     static func describeFocus() -> String {
         guard let element = focusedElement() else { return "focused element: <none>" }
 
