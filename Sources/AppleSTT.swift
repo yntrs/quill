@@ -19,8 +19,17 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
     private var didFinish = false
+    private var finishRequested = false
+    /// Utterances already locked in. Apple starts a new utterance after a short
+    /// pause — if we only kept the latest `formattedString` the previous words vanished.
+    private var committed = ""
+    private var livePartial = ""
     private var bestText = ""
     private var doneTimer: Timer?
+    private var languageId = "el-GR"
+    /// Bumps on every new recognition task so a dying task's late error cannot
+    /// restart us in a loop or wipe the next utterance.
+    private var generation = 0
 
     /// PCM16 mono 16 kHz — same wire format the recorder already produces.
     private let pcmFormat = AVAudioFormat(commonFormat: .pcmFormatInt16,
@@ -53,10 +62,13 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
     /// Greek (and anything else we route here) — prefer on-device when the asset exists.
     func connect(language: String = "el") {
         didFinish = false
+        finishRequested = false
+        committed = ""
+        livePartial = ""
         bestText = ""
+        languageId = language == "el" ? "el-GR" : language
 
-        let localeId = language == "el" ? "el-GR" : language
-        guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: localeId)),
+        guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: languageId)),
               recognizer.isAvailable
         else {
             DispatchQueue.main.async { [weak self] in
@@ -65,36 +77,32 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
             return
         }
         self.recognizer = recognizer
+        startTask(of: recognizer)
+        DispatchQueue.main.async { [weak self] in self?.onReady() }
+    }
+
+    private func startTask(of recognizer: SFSpeechRecognizer) {
+        generation += 1
+        let gen = generation
 
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
-        // Bias common English words a Greek speaker inserts mid-sentence.
-        // Without this, el-GR often writes them in Greek letters (κροκ, μακούς…).
+        request.taskHint = .dictation
         request.contextualStrings = Self.englishContextHints
-        // On-device is faster, private, and usually better for Greek when installed.
         if recognizer.supportsOnDeviceRecognition {
             request.requiresOnDeviceRecognition = true
-            Log.write("Apple STT: on-device \(localeId)")
+            Log.write("Apple STT: on-device \(languageId) committed=\(committed.count)ch")
         } else {
-            Log.write("Apple STT: network \(localeId)")
+            Log.write("Apple STT: network \(languageId) committed=\(committed.count)ch")
         }
         self.request = request
 
         task = recognizer.recognitionTask(with: request) { [weak self] result, error in
-            guard let self, !self.didFinish else { return }
+            guard let self, !self.didFinish, self.generation == gen else { return }
 
             if let result {
-                let text = result.bestTranscription.formattedString
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                // After endAudio Apple often emits an empty isFinal. Never let that
-                // wipe a live transcript we already showed the user.
-                if !text.isEmpty {
-                    self.bestText = text
-                    DispatchQueue.main.async { self.onText(text) }
-                } else {
-                    Log.write("Apple STT: ignoring empty \(result.isFinal ? "final" : "partial")")
-                }
-                if result.isFinal {
+                self.apply(result)
+                if result.isFinal, self.finishRequested {
                     self.complete()
                     return
                 }
@@ -102,19 +110,72 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
 
             if let error {
                 let ns = error as NSError
-                Log.write("Apple STT error: \(ns.domain) code=\(ns.code) — \(error.localizedDescription) bestText=\(self.bestText.count)ch")
-                // 1110 "No speech detected", 216/203 cancel — all fine if we already have words.
-                if !self.bestText.isEmpty {
-                    self.complete()
+                Log.write("Apple STT error: \(ns.domain) code=\(ns.code) — \(error.localizedDescription) bestText=\(self.bestText.count)ch finish=\(self.finishRequested)")
+                if self.finishRequested {
+                    if !self.bestText.isEmpty {
+                        self.complete()
+                    } else {
+                        DispatchQueue.main.async {
+                            self.onFailure(Self.friendlyMessage(for: error))
+                        }
+                    }
                     return
                 }
-                DispatchQueue.main.async {
-                    self.onFailure(Self.friendlyMessage(for: error))
+                // Mid-dictation pause: Apple ends the *utterance*, not the session.
+                // Commit what we have and keep listening on a fresh task.
+                if !self.livePartial.isEmpty {
+                    self.committed = Self.join(self.committed, self.livePartial)
+                    self.livePartial = ""
+                    self.publish()
+                }
+                if let recognizer = self.recognizer {
+                    self.startTask(of: recognizer)
                 }
             }
         }
+    }
 
-        DispatchQueue.main.async { [weak self] in self?.onReady() }
+    private func apply(_ result: SFSpeechRecognitionResult) {
+        let text = result.bestTranscription.formattedString
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if result.isFinal {
+            if !text.isEmpty {
+                committed = Self.join(committed, text)
+            }
+            livePartial = ""
+            publish()
+            return
+        }
+
+        guard !text.isEmpty else { return }
+
+        if !livePartial.isEmpty, !Self.isContinuation(old: livePartial, new: text) {
+            committed = Self.join(committed, livePartial)
+        }
+        livePartial = text
+        publish()
+    }
+
+    private func publish() {
+        bestText = Self.join(committed, livePartial)
+        let snapshot = bestText
+        guard !snapshot.isEmpty else { return }
+        DispatchQueue.main.async { [weak self] in self?.onText(snapshot) }
+    }
+
+    private static func join(_ a: String, _ b: String) -> String {
+        if a.isEmpty { return b }
+        if b.isEmpty { return a }
+        if a.hasSuffix(" ") || b.hasPrefix(" ") { return a + b }
+        return a + " " + b
+    }
+
+    /// Same utterance growing/revising vs a brand-new sentence after a pause.
+    private static func isContinuation(old: String, new: String) -> Bool {
+        if new.hasPrefix(old) || old.hasPrefix(new) { return true }
+        let n = min(old.count, new.count, 20)
+        return n >= 8 && old.prefix(n) == new.prefix(n)
     }
 
     func send(pcm: Data) {
@@ -136,12 +197,17 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
 
     func finish() {
         guard !didFinish else { return }
+        finishRequested = true
+        if !livePartial.isEmpty {
+            committed = Self.join(committed, livePartial)
+            livePartial = ""
+            publish()
+        }
         request?.endAudio()
-        // If the engine never fires isFinal, don't hang the UI.
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.doneTimer?.invalidate()
-            self.doneTimer = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: false) { [weak self] _ in
+            self.doneTimer = Timer.scheduledTimer(withTimeInterval: 1.2, repeats: false) { [weak self] _ in
                 self?.complete()
             }
         }
