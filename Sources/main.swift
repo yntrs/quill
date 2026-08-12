@@ -23,6 +23,7 @@ enum Defaults {
     static let stopPhrase = "stopPhrase"
     static let pauseSeconds = "pauseSeconds"
     static let polish = "polish"
+    static let translate = "translate"
     static let keepHistory = "keepHistory"
     static let notifyUpdates = "notifyUpdates"
     static let lastUpdateCheck = "lastUpdateCheck"
@@ -46,6 +47,7 @@ enum Defaults {
             pauseSeconds: 5.0,
             // Greek STT often misses accents / small slips — polish cleans those up.
             polish: true,
+            translate: TranslateMode.off.rawValue,
             keepHistory: true,
             notifyUpdates: true,
         ])
@@ -68,6 +70,11 @@ enum Defaults {
     static var currentTrigger: Trigger {
         Trigger(rawValue: UserDefaults.standard.string(forKey: trigger) ?? "") ?? .rightCommand
     }
+
+    static var currentTranslate: TranslateMode {
+        TranslateMode(rawValue: UserDefaults.standard.string(forKey: translate) ?? "") ?? .off
+    }
+
     static func flip(_ key: String) { UserDefaults.standard.set(!bool(key), forKey: key) }
 }
 
@@ -362,6 +369,22 @@ final class QuillApp: NSObject, NSApplicationDelegate {
                   action: #selector(toggleInsertAtEnd))
         addToggle(to: menu, title: "Clean up grammar", key: Defaults.polish,
                   action: #selector(togglePolish))
+
+        let translateMenu = NSMenu()
+        translateMenu.autoenablesItems = false
+        let currentTranslate = Defaults.currentTranslate
+        for option in TranslateMode.allCases {
+            let item = NSMenuItem(title: option.menuTitle, action: #selector(setTranslate(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = option.rawValue
+            item.state = (option == currentTranslate) ? .on : .off
+            translateMenu.addItem(item)
+            if option == .off { translateMenu.addItem(.separator()) }
+        }
+        let translateItem = NSMenuItem(title: "Translate", action: nil, keyEquivalent: "")
+        menu.addItem(translateItem)
+        menu.setSubmenu(translateMenu, for: translateItem)
+
         addToggle(to: menu, title: "Stop when I say \u{201C}that\u{2019}s it\u{201D} or \u{201C}that\u{2019}s all\u{201D}", key: Defaults.stopPhrase,
                   action: #selector(toggleStopPhrase))
 
@@ -486,6 +509,19 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         hud.apply(.notice(on
             ? "Grammar cleanup on — adds about a second, and never changes your wording"
             : "Grammar cleanup off"))
+        hud.collapse(after: 3)
+    }
+
+    @objc private func setTranslate(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let mode = TranslateMode(rawValue: raw) else { return }
+        UserDefaults.standard.set(raw, forKey: Defaults.translate)
+        // Recognition should match the language you speak.
+        if let source = mode.sourceLanguage {
+            UserDefaults.standard.set(source, forKey: Defaults.language)
+        }
+        Log.write("translate set to \(raw)")
+        hud.apply(.notice(mode.notice))
         hud.collapse(after: 3)
     }
 
@@ -665,7 +701,10 @@ final class QuillApp: NSObject, NSApplicationDelegate {
     }
 
     private func beginCapture() {
-        let language = UserDefaults.standard.string(forKey: Defaults.language) ?? "el"
+        // Translation direction wins: listen in the source language.
+        let language = Defaults.currentTranslate.sourceLanguage
+            ?? UserDefaults.standard.string(forKey: Defaults.language)
+            ?? "el"
         // Greek: Apple Speech (el-GR). Everything else: Grok streaming STT.
         // xAI's STT is not competitive on Modern Greek; Apple's model is.
         let useAppleGreek = (language == "el")
@@ -802,8 +841,12 @@ final class QuillApp: NSObject, NSApplicationDelegate {
             }
         }
 
-        if Defaults.bool(Defaults.polish), let token = creds?.token {
-            Polisher.warm(token: token)
+        if let token = creds?.token {
+            if Defaults.currentTranslate != .off {
+                Translator.warm(token: token)
+            } else if Defaults.bool(Defaults.polish) {
+                Polisher.warm(token: token)
+            }
         }
 
         if let grok = client as? STTClient, let token = creds?.token {
@@ -1084,8 +1127,23 @@ final class QuillApp: NSObject, NSApplicationDelegate {
             return
         }
 
-        remember(trimmed)
         hud.update(text: trimmed)
+
+        let translate = Defaults.currentTranslate
+        if translate != .off {
+            guard let creds = Auth.current() else {
+                hud.apply(.notice("Sign in to Grok to translate"))
+                hud.collapse(after: 3)
+                completeSession(with: trimmed)
+                return
+            }
+            hud.apply(.thinking)
+            hud.update(text: trimmed)
+            Translator.translate(trimmed, mode: translate, token: creds.token) { [weak self] result in
+                self?.completeSession(with: result)
+            }
+            return
+        }
 
         guard Defaults.bool(Defaults.polish), let creds = Auth.current() else {
             completeSession(with: trimmed)
@@ -1145,6 +1203,7 @@ final class QuillApp: NSObject, NSApplicationDelegate {
             return
         }
 
+        remember(trimmed)
         deliver(trimmed)
     }
 
