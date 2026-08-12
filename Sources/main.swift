@@ -24,6 +24,8 @@ enum Defaults {
     static let pauseSeconds = "pauseSeconds"
     static let polish = "polish"
     static let translate = "translate"
+    static let lastTranslate = "lastTranslate"
+    static let translateDoubleTap = "translateDoubleTap"
     static let keepHistory = "keepHistory"
     static let notifyUpdates = "notifyUpdates"
     static let lastUpdateCheck = "lastUpdateCheck"
@@ -48,6 +50,8 @@ enum Defaults {
             // Greek STT often misses accents / small slips — polish cleans those up.
             polish: true,
             translate: TranslateMode.off.rawValue,
+            lastTranslate: TranslateMode.elToEn.rawValue,
+            translateDoubleTap: false,
             keepHistory: true,
             notifyUpdates: true,
         ])
@@ -73,6 +77,13 @@ enum Defaults {
 
     static var currentTranslate: TranslateMode {
         TranslateMode(rawValue: UserDefaults.standard.string(forKey: translate) ?? "") ?? .off
+    }
+
+    /// Last Greek↔English direction the user picked (never `.off`).
+    static var lastTranslateDirection: TranslateMode {
+        let stored = TranslateMode(rawValue: UserDefaults.standard.string(forKey: lastTranslate) ?? "")
+        if let stored, stored != .off { return stored }
+        return .elToEn
     }
 
     static func flip(_ key: String) { UserDefaults.standard.set(!bool(key), forKey: key) }
@@ -165,7 +176,8 @@ final class QuillApp: NSObject, NSApplicationDelegate {
 
         hotkey.trigger = Defaults.currentTrigger
         applyTapMode()
-        hotkey.onTrigger = { [weak self] in self?.toggle() }
+        hotkey.onTrigger = { [weak self] in self?.handleTriggerTap(double: false) }
+        hotkey.onDoubleTrigger = { [weak self] in self?.handleTriggerTap(double: true) }
         hotkey.onClickAnywhere = { [weak self] point in self?.handleClickAnywhere(at: point) }
         hotkey.onCancel = { [weak self] in self?.cancelSession() }
 
@@ -255,6 +267,7 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         // not permission-gated, so single tap no longer depends on Input Monitoring.
         let safe = wanted
         hotkey.singleTap = safe
+        hotkey.reportDoubleTap = safe && Defaults.bool(Defaults.translateDoubleTap)
         guard loggedTapMode != safe else { return }      // only on change, not every tick
         loggedTapMode = safe
         if wanted && !safe {
@@ -381,6 +394,15 @@ final class QuillApp: NSObject, NSApplicationDelegate {
             translateMenu.addItem(item)
             if option == .off { translateMenu.addItem(.separator()) }
         }
+        translateMenu.addItem(.separator())
+        let doubleTapItem = NSMenuItem(
+            title: "Enable with double tap when single tap is selected",
+            action: #selector(toggleTranslateDoubleTap),
+            keyEquivalent: "")
+        doubleTapItem.target = self
+        doubleTapItem.state = Defaults.bool(Defaults.translateDoubleTap) ? .on : .off
+        doubleTapItem.toolTip = "When Trigger ▸ Single tap is on: double-tap the trigger to turn translation on, single-tap to turn it off. Off = only this menu changes translation."
+        translateMenu.addItem(doubleTapItem)
         let translateItem = NSMenuItem(title: "Translate", action: nil, keyEquivalent: "")
         menu.addItem(translateItem)
         menu.setSubmenu(translateMenu, for: translateItem)
@@ -515,14 +537,66 @@ final class QuillApp: NSObject, NSApplicationDelegate {
     @objc private func setTranslate(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String,
               let mode = TranslateMode(rawValue: raw) else { return }
-        UserDefaults.standard.set(raw, forKey: Defaults.translate)
-        // Recognition should match the language you speak.
+        applyTranslateMode(mode, announce: true)
+    }
+
+    @objc private func toggleTranslateDoubleTap() {
+        Defaults.flip(Defaults.translateDoubleTap)
+        applyTapMode()
+        let on = Defaults.bool(Defaults.translateDoubleTap)
+        Log.write("translateDoubleTap = \(on)")
+        let single = Defaults.bool(Defaults.singleTap)
+        if on, !single {
+            hud.apply(.notice("On — also turn on Trigger ▸ Single tap, then double-tap to translate"))
+        } else if on {
+            hud.apply(.notice("Double-tap trigger = translate on · single tap = translate off"))
+        } else {
+            hud.apply(.notice("Translation only changes from this menu"))
+        }
+        hud.collapse(after: 3.5)
+    }
+
+    private func applyTranslateMode(_ mode: TranslateMode, announce: Bool) {
+        UserDefaults.standard.set(mode.rawValue, forKey: Defaults.translate)
+        if mode != .off {
+            UserDefaults.standard.set(mode.rawValue, forKey: Defaults.lastTranslate)
+        }
         if let source = mode.sourceLanguage {
             UserDefaults.standard.set(source, forKey: Defaults.language)
         }
-        Log.write("translate set to \(raw)")
+        Log.write("translate set to \(mode.rawValue)")
+        guard announce else { return }
         hud.apply(.notice(mode.notice))
         hud.collapse(after: 3)
+    }
+
+    /// Single tap starts/stops dictation and turns translation off.
+    /// Double tap (only when the menu option + single-tap trigger are both on)
+    /// turns translation on, then starts dictation if needed.
+    private func handleTriggerTap(double: Bool) {
+        let shortcutOn = Defaults.bool(Defaults.translateDoubleTap) && Defaults.bool(Defaults.singleTap)
+        if shortcutOn {
+            if double {
+                applyTranslateMode(Defaults.lastTranslateDirection, announce: false)
+                Log.write("double-tap → translate \(Defaults.currentTranslate.rawValue)")
+                if isRecording {
+                    hud.update(translateCaption: Defaults.currentTranslate.hudCaption)
+                    hud.flashTarget(Defaults.currentTranslate.notice, for: 2)
+                    return
+                }
+                startSession()
+                return
+            }
+            if isRecording {
+                stopSession(reason: .hotkey)
+                applyTranslateMode(.off, announce: false)
+            } else {
+                applyTranslateMode(.off, announce: false)
+                startSession()
+            }
+            return
+        }
+        toggle()
     }
 
     @objc private func setPause(_ sender: NSMenuItem) {

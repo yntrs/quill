@@ -108,6 +108,11 @@ final class DoubleTapRightCommand {
     private let debugKeys = ProcessInfo.processInfo.environment["QUILL_DEBUG_KEYS"] != nil
         || UserDefaults.standard.bool(forKey: "debugKeys")
     var onTrigger: () -> Void = {}
+    /// Second tap of the trigger while single-tap dictation is on.
+    var onDoubleTrigger: () -> Void = {}
+    /// When set, a lone tap waits briefly so a second tap can be told apart.
+    var reportDoubleTap = false
+    private var pendingSingle: DispatchWorkItem?
     var onFirstEvent: () -> Void = {}
 
     /// A click anywhere on screen, in CoreGraphics global coordinates. Only
@@ -183,6 +188,9 @@ final class DoubleTapRightCommand {
 
     func stop() {
         loggedFirstEvent = false
+        pendingSingle?.cancel()
+        pendingSingle = nil
+        lastTapAt = 0
         guard let port = tap else { return }
         CGEvent.tapEnable(tap: port, enable: false)
         CFMachPortInvalidate(port)
@@ -224,7 +232,7 @@ final class DoubleTapRightCommand {
                 .isEmpty
 
             if trigger == .f5, code == Self.f5KeyCode, bareKey {
-                DispatchQueue.main.async { [weak self] in self?.onTrigger() }
+                DispatchQueue.main.async { [weak self] in self?.noteTap() }
                 // Swallowed so macOS dictation does not also fire on the same press.
                 return true
             }
@@ -284,8 +292,38 @@ final class DoubleTapRightCommand {
 
         if singleTap, pressedAt > 0, !sawKeyDownSinceTap, !didSomethingElse, now - pressedAt < tapMaxHold {
             pressedAt = 0
-            DispatchQueue.main.async { [weak self] in self?.onTrigger() }
+            noteTap()
         }
         return false
+    }
+
+    /// A completed bare tap. If `reportDoubleTap` is on, wait to see whether a
+    /// second tap follows; otherwise fire immediately as today.
+    private func noteTap() {
+        let now = CACurrentMediaTime()
+        guard reportDoubleTap else {
+            lastTapAt = 0
+            pendingSingle?.cancel()
+            pendingSingle = nil
+            DispatchQueue.main.async { [weak self] in self?.onTrigger() }
+            return
+        }
+        if lastTapAt > 0, now - lastTapAt < window {
+            lastTapAt = 0
+            pendingSingle?.cancel()
+            pendingSingle = nil
+            DispatchQueue.main.async { [weak self] in self?.onDoubleTrigger() }
+            return
+        }
+        lastTapAt = now
+        pendingSingle?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.lastTapAt = 0
+            self.pendingSingle = nil
+            self.onTrigger()
+        }
+        pendingSingle = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + window, execute: work)
     }
 }
