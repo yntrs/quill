@@ -85,9 +85,14 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
 
             if let result {
                 let text = result.bestTranscription.formattedString
-                self.bestText = text
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                // After endAudio Apple often emits an empty isFinal. Never let that
+                // wipe a live transcript we already showed the user.
                 if !text.isEmpty {
+                    self.bestText = text
                     DispatchQueue.main.async { self.onText(text) }
+                } else {
+                    Log.write("Apple STT: ignoring empty \(result.isFinal ? "final" : "partial")")
                 }
                 if result.isFinal {
                     self.complete()
@@ -96,20 +101,15 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
             }
 
             if let error {
-                // Cancellation after endAudio is normal; if we already have text, finish cleanly.
                 let ns = error as NSError
-                if ns.domain == "kAFAssistantErrorDomain", ns.code == 216 || ns.code == 203 {
-                    if !self.bestText.isEmpty { self.complete() }
-                    return
-                }
+                Log.write("Apple STT error: \(ns.domain) code=\(ns.code) — \(error.localizedDescription) bestText=\(self.bestText.count)ch")
+                // 1110 "No speech detected", 216/203 cancel — all fine if we already have words.
                 if !self.bestText.isEmpty {
                     self.complete()
                     return
                 }
-                let message = Self.friendlyMessage(for: error)
-                Log.write("Apple STT error: \(ns.domain) code=\(ns.code) — \(error.localizedDescription)")
                 DispatchQueue.main.async {
-                    self.onFailure(message)
+                    self.onFailure(Self.friendlyMessage(for: error))
                 }
             }
         }
@@ -162,6 +162,7 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
         didFinish = true
         doneTimer?.invalidate()
         let text = bestText
+        Log.write("Apple STT complete — \(text.isEmpty ? "EMPTY" : "\(text.count)ch")")
         task = nil
         request = nil
         DispatchQueue.main.async { [weak self] in self?.onComplete(text) }

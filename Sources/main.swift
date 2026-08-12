@@ -761,6 +761,7 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         stopReason = .hotkey
         didRunVoiceCommand = false
         lastStopCandidate = nil
+        lastActivityText = nil
 
         client.onReady = { [weak self] in
             guard let self else { return }
@@ -1061,8 +1062,17 @@ final class QuillApp: NSObject, NSApplicationDelegate {
 
     private func finishSession(with text: String) {
         stt = nil
+        // Apple STT (and occasionally Grok) can finalise with an empty string even
+        // after live partials were shown. Prefer the last words we already displayed.
+        var raw = text
+        if raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           let backup = lastActivityText,
+           !backup.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            Log.write("  complete was empty — using last live transcript (\(backup.count)ch)")
+            raw = backup
+        }
         // The command phrase must never reach the target app.
-        let trimmed = VoiceCommands.stripAll(text).trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = VoiceCommands.stripAll(raw).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             if didRunVoiceCommand {
                 hud.apply(.notice("Opened Grok Build"))
