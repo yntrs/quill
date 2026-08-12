@@ -684,6 +684,14 @@ final class QuillApp: NSObject, NSApplicationDelegate {
     @objc private func setLanguage(_ sender: NSMenuItem) {
         guard let code = sender.representedObject as? String else { return }
         UserDefaults.standard.set(code, forKey: Defaults.language)
+        // Spoken language picks the matching translation direction.
+        if code == "el" {
+            applyTranslateMode(.elToEn, announce: true)
+        } else if code == "en" {
+            applyTranslateMode(.enToEl, announce: true)
+        } else {
+            Log.write("language set to \(code)")
+        }
     }
 
     @objc private func copyHistory(_ sender: NSMenuItem) {
