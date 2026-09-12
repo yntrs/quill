@@ -234,7 +234,8 @@ enum Inserter {
         // Replacing a selection wins over appending: the user highlighted
         // something specific and expects exactly that to be swapped out.
         if let selection, restore(selection) {
-            if setSelectedText(payload), confirmLanded(payload) {
+            let beforeReplace = focusedValue()
+            if setSelectedText(payload), confirmLanded(payload, previous: beforeReplace) {
                 Log.write("  → replaced selection (\(selection.range.length) chars)")
                 completion(Outcome(method: .accessibility, app: app))
                 return
@@ -274,7 +275,7 @@ enum Inserter {
         if after { payload += " " }
 
         let forceClipboard = ProcessInfo.processInfo.environment["QUILL_FORCE_CLIPBOARD"] != nil
-        if !forceClipboard, setSelectedText(payload), confirmLanded(payload) {
+        if !forceClipboard, setSelectedText(payload), confirmLanded(payload, previous: existing) {
             Log.write("  → accessibility, confirmed")
             completion(Outcome(method: .accessibility, app: app))
             return
@@ -290,12 +291,28 @@ enum Inserter {
     /// Did the Accessibility write actually take? Several apps — web views in
     /// particular — return success from the setter and change nothing. If the
     /// field cannot be read back at all we have to take the setter at its word.
-    private static func confirmLanded(_ payload: String) -> Bool {
+    ///
+    /// The old "last 24 characters are somewhere in the field" check was a
+    /// false positive on grok.com: consecutive dictations share a similar
+    /// ending, AX reported success, and nothing new appeared.
+    private static func confirmLanded(_ payload: String, previous: String?) -> Bool {
         guard let readback = focusedFieldValue() else { return true }
         let needle = payload.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !needle.isEmpty else { return true }
-        let tail = String(needle.suffix(24))
-        return readback.contains(tail)
+
+        if let previous, previous.contains(String(needle.suffix(min(32, needle.count)))) {
+            let grew = readback.count >= previous.count + max(8, needle.count / 2)
+            if grew { return true }
+            if needle.count >= 16 {
+                let start = needle.index(needle.startIndex, offsetBy: needle.count / 4)
+                let end = needle.index(start, offsetBy: min(40, needle.count / 2), limitedBy: needle.endIndex) ?? needle.endIndex
+                let mid = String(needle[start..<end])
+                if !mid.isEmpty, !previous.contains(mid), readback.contains(mid) { return true }
+            }
+            return false
+        }
+
+        return readback.contains(String(needle.suffix(min(32, needle.count))))
     }
 
     /// The focused field's current contents, without disturbing anything.

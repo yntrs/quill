@@ -39,18 +39,26 @@ final class HUD {
         }
     }
 
+    /// The wide "Listening…" bar. Off = dictate with no overlay; trigger,
+    /// insert and other apps are unchanged.
+    var showsSessionBar = true {
+        didSet {
+            guard oldValue != showsSessionBar else { return }
+            apply(state, animated: false)
+        }
+    }
+
     func install() {
-        let panel = ensurePanel()
+        _ = ensurePanel()
         content.onClick = { [weak self] in self?.onClick() }
         content.onMoved = { [weak self] rect in self?.snapToEdge(from: rect) }
         apply(.idle, animated: false)
-        panel.orderFrontRegardless()
     }
 
     /// Re-place the panel on the desktop that just became active.
     private func handleSpaceChange() {
         guard let panel else { return }
-        if case .idle = state, !showsIdlePill {
+        if shouldHide(compact: isCompactState) {
             panel.orderOut(nil)
             return
         }
@@ -65,6 +73,10 @@ final class HUD {
 
     func setCornerButton(visible: Bool) {
         showsIdlePill = visible
+    }
+
+    private func shouldHide(compact: Bool) -> Bool {
+        compact ? !showsIdlePill : !showsSessionBar
     }
 
     func apply(_ newState: State, animated: Bool = true) {
@@ -86,7 +98,7 @@ final class HUD {
         // Position it either way, so it is already in the right place the moment a
         // session starts — but stay hidden if the idle pill is switched off.
         let target = frame(compact: compact)
-        if compact && !showsIdlePill {
+        if shouldHide(compact: compact) {
             panel.setFrame(target, display: false)
             panel.orderOut(nil)
             return
@@ -310,6 +322,9 @@ private final class HUDView: NSView {
     private let translateLabel = NSTextField(labelWithString: "")
     private var translateAfterUsage: NSLayoutConstraint!
     private var translateAfterWave: NSLayoutConstraint!
+    private var usageAfterDot: NSLayoutConstraint!
+    private var usageAfterElapsed: NSLayoutConstraint!
+    private var usageAfterWave: NSLayoutConstraint!
     private let targetLabel = NSTextField(labelWithString: "")
     private let targetIcon = NSImageView()
     private let transcriptLabel = NSTextField(labelWithString: "")
@@ -449,7 +464,6 @@ private final class HUDView: NSView {
             waveform.heightAnchor.constraint(equalToConstant: 14),
             waveform.widthAnchor.constraint(equalToConstant: 92),
 
-            usageLabel.leadingAnchor.constraint(equalTo: waveform.trailingAnchor, constant: 10),
             usageLabel.centerYAnchor.constraint(equalTo: dot.centerYAnchor),
 
             translateLabel.centerYAnchor.constraint(equalTo: dot.centerYAnchor),
@@ -468,6 +482,11 @@ private final class HUDView: NSView {
             transcriptLabel.bottomAnchor.constraint(equalTo: expanded.bottomAnchor, constant: -14),
             transcriptLabel.topAnchor.constraint(greaterThanOrEqualTo: dot.bottomAnchor, constant: 8),
         ])
+
+        usageAfterDot = usageLabel.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 8)
+        usageAfterElapsed = usageLabel.leadingAnchor.constraint(equalTo: elapsedLabel.trailingAnchor, constant: 10)
+        usageAfterWave = usageLabel.leadingAnchor.constraint(equalTo: waveform.trailingAnchor, constant: 10)
+        usageAfterWave.isActive = true
 
         translateAfterUsage = translateLabel.leadingAnchor.constraint(equalTo: usageLabel.trailingAnchor, constant: 8)
         translateAfterWave = translateLabel.leadingAnchor.constraint(equalTo: waveform.trailingAnchor, constant: 10)
@@ -549,6 +568,7 @@ private final class HUDView: NSView {
             elapsedLabel.font = .systemFont(ofSize: 11.5, weight: .medium)
             elapsedLabel.stringValue = "Inserted"
             elapsedLabel.isHidden = false
+            applyUsageVisibility()
             targetLabel.stringValue = app ?? ""
             targetIcon.isHidden = (targetIcon.image == nil)
 
@@ -560,6 +580,8 @@ private final class HUDView: NSView {
             elapsedLabel.isHidden = true
             targetLabel.stringValue = ""
             targetIcon.isHidden = true
+            applyTranslateCaptionVisibility()
+            applyUsageVisibility()
             transcriptLabel.textColor = NSColor.white.withAlphaComponent(0.78)
             transcriptLabel.stringValue = message
         }
@@ -596,7 +618,7 @@ private final class HUDView: NSView {
 
     func setUsagePercent(_ percent: Int?) {
         if let percent {
-            usageLabel.stringValue = "\(max(0, min(100, percent)))%"
+            usageLabel.stringValue = "Usage \(max(0, min(100, percent)))%"
             usageLabel.textColor = percent >= 90
                 ? NSColor.systemOrange.withAlphaComponent(0.95)
                 : NSColor.white.withAlphaComponent(0.55)
@@ -609,6 +631,9 @@ private final class HUDView: NSView {
     private func applyUsageVisibility() {
         let show = !usageLabel.stringValue.isEmpty && !isIdle
         usageLabel.isHidden = !show
+        usageAfterDot.isActive = show && elapsedLabel.isHidden && waveform.isHidden
+        usageAfterElapsed.isActive = show && !elapsedLabel.isHidden && waveform.isHidden
+        usageAfterWave.isActive = show && !waveform.isHidden
         translateAfterUsage.isActive = show
         translateAfterWave.isActive = !show
     }

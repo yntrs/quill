@@ -2,6 +2,7 @@ import Cocoa
 import AVFoundation
 import IOKit.hid
 import Speech
+import ServiceManagement
 
 // MARK: - Settings
 
@@ -15,6 +16,8 @@ enum Defaults {
     static let language = "language"
     static let history = "history"
     static let cornerButton = "cornerButton"
+    static let sessionBar = "sessionBar"
+    static let overlayDefaultApplied = "overlayDefaultApplied"
     static let insertAtEnd = "insertAtEnd"
     static let clickToInsert = "clickToInsert"
     static let requireTextField = "requireTextField"
@@ -41,7 +44,8 @@ enum Defaults {
     static func register() {
         UserDefaults.standard.register(defaults: [
             language: "el",
-            cornerButton: true,
+            cornerButton: false,
+            sessionBar: false,
             insertAtEnd: true,
             clickToInsert: true,
             requireTextField: true,
@@ -57,12 +61,19 @@ enum Defaults {
             keepHistory: true,
             notifyUpdates: true,
         ])
-        // Existing installs already have the old English registration; force Greek
-        // once so "understand Greek well" is the default without fighting later choices.
+        // Personal build: Greek speech. Translate stays Off until a double-tap
+        // (that tap uses Greek → English). A single tap must not start Translate.
+        UserDefaults.standard.set("el", forKey: language)
+        UserDefaults.standard.set(TranslateMode.off.rawValue, forKey: translate)
+        UserDefaults.standard.set(TranslateMode.elToEn.rawValue, forKey: lastTranslate)
+        UserDefaults.standard.set(true, forKey: polish)
         if !UserDefaults.standard.bool(forKey: greekDefaultApplied) {
-            UserDefaults.standard.set("el", forKey: language)
-            UserDefaults.standard.set(true, forKey: polish)
             UserDefaults.standard.set(true, forKey: greekDefaultApplied)
+        }
+        if !UserDefaults.standard.bool(forKey: overlayDefaultApplied) {
+            UserDefaults.standard.set(false, forKey: cornerButton)
+            UserDefaults.standard.set(false, forKey: sessionBar)
+            UserDefaults.standard.set(true, forKey: overlayDefaultApplied)
         }
     }
 
@@ -111,6 +122,9 @@ final class QuillApp: NSObject, NSApplicationDelegate {
     private var pendingPCM: [Data] = []
     private var socketReady = false
     private var sawAnyText = false
+    /// Live words seen *while* recording. After stop, Apple may still emit a
+    /// hallucinated "ναι" as isFinal — that must not count as speech.
+    private var heardLiveText = false
     private var stopReason: StopReason = .hotkey
     private var didRunVoiceCommand = false
     private var finaliseStartedAt: Date?
@@ -121,6 +135,13 @@ final class QuillApp: NSObject, NSApplicationDelegate {
     private var lastActivityText: String?
     private var noiseFloor: Float = 0.02
     private var capturedSelection: Inserter.Selection?
+    /// Translate ran and failed — insert the original and say so, instead of
+    /// leaving the HUD on "Translating" as if nothing happened.
+    private var translateFailed = false
+    private var translateFailReason: String?
+    /// Mode that was on when this take started. A single-tap stop turns the
+    /// *preference* off for next time, but this take must still translate.
+    private var sessionTranslate: TranslateMode = .off
     private var startedAt: Date?
 
     private var silenceTimer: Timer?
@@ -159,6 +180,7 @@ final class QuillApp: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Defaults.register()
+        LoginItem.adoptIfNeeded()
         NSApp.setActivationPolicy(.accessory)
         buildStatusItem()
 
@@ -174,6 +196,7 @@ final class QuillApp: NSObject, NSApplicationDelegate {
             self.toggle()
         }
         hud.showsIdlePill = Defaults.bool(Defaults.cornerButton)
+        hud.showsSessionBar = Defaults.bool(Defaults.sessionBar)
         hud.install()
 
         hotkey.trigger = Defaults.currentTrigger
@@ -423,6 +446,8 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         appearanceMenu.autoenablesItems = false
         addToggle(to: appearanceMenu, title: "Show idle pill", key: Defaults.cornerButton,
                   action: #selector(toggleCornerButton))
+        addToggle(to: appearanceMenu, title: "Show session panel", key: Defaults.sessionBar,
+                  action: #selector(toggleSessionBar))
         let resetItem = NSMenuItem(title: "Reset panel position",
                                    action: #selector(resetPanelPosition), keyEquivalent: "")
         resetItem.target = self
@@ -579,9 +604,9 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         hud.collapse(after: 3)
     }
 
-    /// Single tap starts/stops dictation and turns translation off.
-    /// Double tap (only when the menu option + single-tap trigger are both on)
-    /// turns translation on, then starts dictation if needed.
+    /// Single tap = dictate in the current language, no translation.
+    /// Double tap = Greek → English (or the last direction) and start.
+    /// Stopping a take does not change that take's mode.
     private func handleTriggerTap(double: Bool) {
         let shortcutOn = Defaults.bool(Defaults.translateDoubleTap) && Defaults.bool(Defaults.singleTap)
         if shortcutOn {
@@ -589,6 +614,7 @@ final class QuillApp: NSObject, NSApplicationDelegate {
                 applyTranslateMode(Defaults.lastTranslateDirection, announce: false)
                 Log.write("double-tap → translate \(Defaults.currentTranslate.rawValue)")
                 if isRecording {
+                    sessionTranslate = Defaults.currentTranslate
                     hud.update(translateCaption: Defaults.currentTranslate.hudCaption)
                     hud.flashTarget(Defaults.currentTranslate.notice, for: 2)
                     return
@@ -598,7 +624,6 @@ final class QuillApp: NSObject, NSApplicationDelegate {
             }
             if isRecording {
                 stopSession(reason: .hotkey)
-                applyTranslateMode(.off, announce: false)
             } else {
                 applyTranslateMode(.off, announce: false)
                 startSession()
@@ -628,7 +653,17 @@ final class QuillApp: NSObject, NSApplicationDelegate {
             : "Will start even with no text field"))
         hud.collapse(after: 3)
     }
-    @objc private func toggleLoginItem()     { LoginItem.setEnabled(!LoginItem.isEnabled) }
+    @objc private func toggleLoginItem() {
+        let want = !LoginItem.isEnabled
+        LoginItem.setEnabled(want)
+        if want, !LoginItem.isEnabled {
+            hud.apply(.notice("Allow Quill in System Settings ▸ General ▸ Login Items"))
+            hud.collapse(after: 5)
+        } else {
+            hud.apply(.notice(want ? "Quill will open when you log in" : "Won't open at login"))
+            hud.collapse(after: 2.5)
+        }
+    }
 
     @objc private func setTrigger(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String,
@@ -664,6 +699,13 @@ final class QuillApp: NSObject, NSApplicationDelegate {
 
     @objc private func resetPanelPosition() {
         hud.resetPosition()
+    }
+
+    @objc private func toggleSessionBar() {
+        Defaults.flip(Defaults.sessionBar)
+        let showing = Defaults.bool(Defaults.sessionBar)
+        hud.showsSessionBar = showing
+        Log.write("session panel \(showing ? "shown" : "hidden")")
     }
 
     @objc private func toggleCornerButton() {
@@ -798,7 +840,7 @@ final class QuillApp: NSObject, NSApplicationDelegate {
             if !Inserter.hasInsertableFocus() {
                 Log.write("blocked start — no insertable focus (\(Inserter.describeFocus()))")
                 hud.apply(.notice("No cursor in a text field — click where you want to type, then try again"))
-                hud.collapse(after: 4)
+                hud.collapse(after: 1)
                 return
             }
         }
@@ -921,10 +963,14 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         pendingPCM = []
         socketReady = false
         sawAnyText = false
+        heardLiveText = false
         stopReason = .hotkey
         didRunVoiceCommand = false
         lastStopCandidate = nil
         lastActivityText = nil
+        translateFailed = false
+        translateFailReason = nil
+        sessionTranslate = Defaults.currentTranslate
 
         client.onReady = { [weak self] in
             guard let self else { return }
@@ -965,7 +1011,8 @@ final class QuillApp: NSObject, NSApplicationDelegate {
             }
         }
 
-        if let token = creds?.token {
+        Auth.refreshIfNeeded { fresh in
+            guard let token = fresh?.token else { return }
             if Defaults.currentTranslate != .off {
                 Translator.warm(token: token)
             } else if Defaults.bool(Defaults.polish) {
@@ -1035,7 +1082,10 @@ final class QuillApp: NSObject, NSApplicationDelegate {
             self.logAudioState()
             self.abortSession(message: self.diagnosis())
         }
-        maxDurationTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: false) { [weak self] _ in
+        // Translate sessions wait for the user to finish talking; don't cut
+        // them off at five minutes. Still cap a forgotten mic at 30 minutes.
+        let recordingCap: TimeInterval = Defaults.currentTranslate != .off ? 1800 : 300
+        maxDurationTimer = Timer.scheduledTimer(withTimeInterval: recordingCap, repeats: false) { [weak self] _ in
             guard let self, self.isRecording else { return }
             self.stopSession(reason: .hotkey)
         }
@@ -1065,6 +1115,15 @@ final class QuillApp: NSObject, NSApplicationDelegate {
             if self.socketReady { client.send(pcm: slice) } else { self.pendingPCM.append(slice) }
             offset = end
         }
+    }
+
+    /// Apple's Greek model emits this as a final result on a silent start→stop.
+    private func isGhostFiller(_ text: String) -> Bool {
+        let folded = text
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
+            .folding(options: [.caseInsensitive, .diacriticInsensitive],
+                     locale: Locale(identifier: "el_GR"))
+        return folded == "ναι" || folded == "yes"
     }
 
     /// Why did nothing come back? "No speech detected" was covering four
@@ -1222,6 +1281,7 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         // Never discard the session just because no partial has arrived yet — on
         // the first recording the socket is often still connecting. Let it finish
         // and decide on the actual transcript instead.
+        heardLiveText = sawAnyText
         Log.write("stop (\(reason == .click ? "click" : (reason == .voice ? "voice" : "hotkey/pill"))) — finalising, sawText=\(sawAnyText)")
         finaliseStartedAt = Date()
         logAudioState()
@@ -1242,6 +1302,14 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         }
         // The command phrase must never reach the target app.
         let trimmed = VoiceCommands.stripAll(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+        // Quick tap with no live words: Apple invents "ναι" as isFinal even
+        // when it also reports "no speech". Peak alone misses this (often ≥0.008).
+        if !trimmed.isEmpty, !heardLiveText, isGhostFiller(trimmed) {
+            Log.write("  discarded ghost transcript \"\(trimmed)\"")
+            hud.apply(.notice("No speech detected"))
+            hud.collapse(after: 1)
+            return
+        }
         guard !trimmed.isEmpty else {
             if didRunVoiceCommand {
                 hud.apply(.notice("Opened Grok Build"))
@@ -1255,19 +1323,27 @@ final class QuillApp: NSObject, NSApplicationDelegate {
 
         hud.update(text: trimmed)
 
-        let translate = Defaults.currentTranslate
+        let translate = sessionTranslate
         if translate != .off {
-            guard let creds = Auth.current() else {
-                hud.apply(.notice("Sign in to Grok to translate"))
-                hud.collapse(after: 3)
-                completeSession(with: trimmed)
-                return
-            }
             hud.apply(.thinking)
             hud.update(text: trimmed)
-            Translator.translate(trimmed, mode: translate, token: creds.token) { [weak self] result in
-                self?.refreshUsage(force: true)
-                self?.completeSession(with: result)
+            translateFailed = false
+            translateFailReason = nil
+            Auth.refreshIfNeeded { [weak self] creds in
+                guard let self else { return }
+                guard let creds else {
+                    self.translateFailed = true
+                    self.translateFailReason = "unauthenticated"
+                    self.hud.apply(.notice("Sign in to Grok to translate"))
+                    self.completeSession(with: trimmed)
+                    return
+                }
+                Translator.translate(trimmed, mode: translate, token: creds.token) { [weak self] result, didTranslate, reason in
+                    self?.translateFailed = !didTranslate
+                    self?.translateFailReason = reason
+                    self?.refreshUsage(force: true)
+                    self?.completeSession(with: result)
+                }
             }
             return
         }
@@ -1353,9 +1429,27 @@ final class QuillApp: NSObject, NSApplicationDelegate {
                         Log.write("  tail: stop → inserted in "
                             + String(format: "%.2fs", Date().timeIntervalSince(started)))
                     }
-                    self.hud.apply(.delivered(outcome.app))
-                    self.hud.update(text: trimmed)
-                    self.hud.collapse(after: 0.7)
+                    if self.translateFailed {
+                        self.translateFailed = false
+                        let reason = (self.translateFailReason ?? "").lowercased()
+                        self.translateFailReason = nil
+                        let message: String
+                        if reason.contains("401") || reason.contains("403")
+                            || reason.contains("unauth") || reason.contains("credential") {
+                            message = "Grok session expired — inserted what you said. Open Grok once to sign in."
+                        } else if reason.contains("timed out") {
+                            message = "Translation timed out — inserted what you said"
+                        } else {
+                            message = "Translation failed — inserted what you said"
+                        }
+                        self.hud.apply(.notice(message))
+                        self.hud.update(text: trimmed)
+                        self.hud.collapse(after: 4)
+                    } else {
+                        self.hud.apply(.delivered(outcome.app))
+                        self.hud.update(text: trimmed)
+                        self.hud.collapse(after: 0.7)
+                    }
                 case .blocked:
                     self.hud.apply(.notice("Grant Accessibility to Quill so it can write into apps"))
                     self.hud.collapse(after: 4)
@@ -1380,7 +1474,8 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         stt = nil
         refreshIcon()
         hud.apply(.notice(message))
-        hud.collapse(after: 4)
+        let noSpeech = message.localizedCaseInsensitiveContains("no speech detected")
+        hud.collapse(after: noSpeech ? 1 : 4)
     }
 
     private func invalidateTimers() {
@@ -1409,23 +1504,110 @@ final class QuillApp: NSObject, NSApplicationDelegate {
 enum LoginItem {
     static let label = "com.freeze.quill"
     static var plistPath: String { NSHomeDirectory() + "/Library/LaunchAgents/\(label).plist" }
-    static var isEnabled: Bool { FileManager.default.fileExists(atPath: plistPath) }
+
+    static var isEnabled: Bool {
+        if #available(macOS 13.0, *) {
+            return SMAppService.mainApp.status == .enabled
+        }
+        return FileManager.default.fileExists(atPath: plistPath)
+    }
+
+    /// The old LaunchAgent used `open -a /path/to/Quill.app`, which does not
+    /// launch at login. Move checked users onto the system Login Item.
+    static func adoptIfNeeded() {
+        let legacy = FileManager.default.fileExists(atPath: plistPath)
+        guard legacy else { return }
+        if #available(macOS 13.0, *) {
+            bootoutLegacy()
+            removeLegacyPlist()
+            do {
+                if SMAppService.mainApp.status != .enabled {
+                    try SMAppService.mainApp.register()
+                }
+                if SMAppService.mainApp.status == .requiresApproval {
+                    SMAppService.openSystemSettingsLoginItems()
+                }
+                Log.write("login item migrated to SMAppService")
+            } catch {
+                Log.write("login item migrate failed — \(error.localizedDescription)")
+                setLegacyEnabled(true)
+            }
+        } else {
+            setLegacyEnabled(true)
+        }
+    }
 
     static func setEnabled(_ enabled: Bool) {
+        if #available(macOS 13.0, *) {
+            do {
+                if enabled {
+                    bootoutLegacy()
+                    removeLegacyPlist()
+                    if SMAppService.mainApp.status == .enabled { return }
+                    try SMAppService.mainApp.register()
+                    if SMAppService.mainApp.status == .requiresApproval {
+                        SMAppService.openSystemSettingsLoginItems()
+                    }
+                    Log.write("login item registered")
+                } else {
+                    if SMAppService.mainApp.status == .enabled {
+                        try SMAppService.mainApp.unregister()
+                    }
+                    bootoutLegacy()
+                    removeLegacyPlist()
+                    Log.write("login item unregistered")
+                }
+            } catch {
+                Log.write("login item failed — \(error.localizedDescription)")
+                if enabled { setLegacyEnabled(true) }
+            }
+            return
+        }
+        setLegacyEnabled(enabled)
+    }
+
+    private static func setLegacyEnabled(_ enabled: Bool) {
         let fm = FileManager.default
         if enabled {
+            let exe = Bundle.main.executablePath ?? (Bundle.main.bundlePath + "/Contents/MacOS/Quill")
             let plist: [String: Any] = [
                 "Label": label,
-                "ProgramArguments": ["/usr/bin/open", "-a", Bundle.main.bundlePath],
+                "ProgramArguments": [exe],
                 "RunAtLoad": true,
+                "LimitLoadToSessionType": "Aqua",
+                "ProcessType": "Interactive",
             ]
             try? fm.createDirectory(atPath: NSHomeDirectory() + "/Library/LaunchAgents",
                                     withIntermediateDirectories: true)
             let data = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
             try? data?.write(to: URL(fileURLWithPath: plistPath))
+            bootstrapLegacy()
         } else {
-            try? fm.removeItem(atPath: plistPath)
+            bootoutLegacy()
+            removeLegacyPlist()
         }
+    }
+
+    private static func removeLegacyPlist() {
+        try? FileManager.default.removeItem(atPath: plistPath)
+    }
+
+    private static func bootoutLegacy() {
+        runLaunchctl(["bootout", "gui/\(getuid())/\(label)"])
+    }
+
+    private static func bootstrapLegacy() {
+        runLaunchctl(["bootstrap", "gui/\(getuid())", plistPath])
+    }
+
+    private static func runLaunchctl(_ arguments: [String]) {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        task.arguments = arguments
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+        try? task.run()
+        task.waitUntilExit()
     }
 }
 

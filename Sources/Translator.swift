@@ -53,7 +53,11 @@ enum Translator {
 
     private static let session: URLSession = {
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 14
+        // First token from grok-4.5 can take a long time after a long dictation.
+        // timeoutIntervalForRequest is idle-until-next-byte, not total time —
+        // a short value is what aborted "Translating…" on long speech.
+        config.timeoutIntervalForRequest = 300
+        config.timeoutIntervalForResource = 600
         config.waitsForConnectivity = false
         return URLSession(configuration: config)
     }()
@@ -71,55 +75,81 @@ enum Translator {
         session.dataTask(with: request) { _, _, _ in }.resume()
     }
 
+    /// `didTranslate` is false when we had to fall back to the original text.
     static func translate(_ text: String, mode: TranslateMode, token: String,
-                          completion: @escaping (String) -> Void) {
+                          completion: @escaping (_ text: String, _ didTranslate: Bool, _ failReason: String?) -> Void) {
         let original = text
         func giveUp(_ why: String) {
             Log.write("  translate skipped — \(why)")
-            DispatchQueue.main.async { completion(original) }
+            DispatchQueue.main.async { completion(original, false, why) }
         }
 
         guard mode != .off else { return giveUp("off") }
         guard text.count >= 2 else { return giveUp("too short") }
 
-        var request = URLRequest(url: endpoint)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 12
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: [
-            "model": model,
-            "temperature": 0.25,
-            "max_tokens": 2000,
-            "messages": [
-                ["role": "system", "content": instructions(for: mode)],
-                ["role": "user", "content": text],
-            ],
-        ])
+        func attempt(token: String, remainingRetries: Int) {
+            var request = URLRequest(url: endpoint)
+            request.httpMethod = "POST"
+            // Wait for the model, not a wall clock. Long speech → long translation.
+            request.timeoutInterval = 300
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            let outTokens = min(8000, max(2000, text.count))
+            request.httpBody = try? JSONSerialization.data(withJSONObject: [
+                "model": model,
+                "temperature": 0.25,
+                "max_tokens": outTokens,
+                "messages": [
+                    ["role": "system", "content": instructions(for: mode)],
+                    ["role": "user", "content": text],
+                ],
+            ])
 
-        let started = Date()
-        session.dataTask(with: request) { data, response, error in
-            if let error { return giveUp(error.localizedDescription) }
-            if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-                let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
-                return giveUp("HTTP \(http.statusCode) \(body.prefix(120))")
-            }
-            guard let data,
-                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let choices = root["choices"] as? [[String: Any]],
-                  let message = choices.first?["message"] as? [String: Any],
-                  let raw = message["content"] as? String
-            else { return giveUp("unreadable response") }
+            let started = Date()
+            session.dataTask(with: request) { data, response, error in
+                if let error {
+                    let ns = error as NSError
+                    let transient = ns.code == NSURLErrorNetworkConnectionLost
+                        || ns.code == NSURLErrorNotConnectedToInternet
+                        || ns.code == NSURLErrorTimedOut
+                    if transient, remainingRetries > 0 {
+                        Log.write("  translate \(ns.code) — retrying once")
+                        attempt(token: token, remainingRetries: remainingRetries - 1)
+                        return
+                    }
+                    return giveUp(error.localizedDescription)
+                }
+                if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                    let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                    if (http.statusCode == 401 || http.statusCode == 403), remainingRetries > 0 {
+                        Log.write("  translate HTTP \(http.statusCode) — refreshing Grok session")
+                        Auth.refreshIfNeeded(force: true) { creds in
+                            guard let creds else { return giveUp("HTTP \(http.statusCode) \(body.prefix(120))") }
+                            attempt(token: creds.token, remainingRetries: remainingRetries - 1)
+                        }
+                        return
+                    }
+                    return giveUp("HTTP \(http.statusCode) \(body.prefix(120))")
+                }
+                guard let data,
+                      let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let choices = root["choices"] as? [[String: Any]],
+                      let message = choices.first?["message"] as? [String: Any],
+                      let raw = message["content"] as? String
+                else { return giveUp("unreadable response") }
 
-            let candidate = clean(raw)
-            guard looksLikeTranslation(candidate, mode: mode) else {
-                return giveUp("result did not look like a translation")
-            }
+                let candidate = clean(raw)
+                guard looksLikeTranslation(candidate, mode: mode) else {
+                    return giveUp("result did not look like a translation (\(candidate.prefix(60)))")
+                }
 
-            let ms = Int(Date().timeIntervalSince(started) * 1000)
-            Log.write("  translated in \(ms)ms (\(mode.rawValue))")
-            DispatchQueue.main.async { completion(candidate) }
-        }.resume()
+                let ms = Int(Date().timeIntervalSince(started) * 1000)
+                Log.write("  translated in \(ms)ms (\(mode.rawValue))")
+                DispatchQueue.main.async { completion(candidate, true, nil) }
+            }.resume()
+        }
+
+        attempt(token: token, remainingRetries: 1)
     }
 
     private static func instructions(for mode: TranslateMode) -> String {
@@ -176,12 +206,19 @@ enum Translator {
         return out
     }
 
-    /// Cheap sanity check: not empty, not a refusal, and mostly the target script.
+    /// Cheap sanity check: not empty, not a model refusal, and mostly the target script.
+    ///
+    /// Do not ban ordinary English like "I can't wait" (ανυπομονώ) or "I'm sorry".
+    /// The old "i can't" / "i cannot" / "i'm sorry" list rejected real translations.
     private static func looksLikeTranslation(_ text: String, mode: TranslateMode) -> Bool {
         guard !text.isEmpty else { return false }
         let lower = text.lowercased()
-        let banned = ["as an ai", "i cannot", "i can't", "here's a translation",
-                      "here is the translation", "translated version", "i'm sorry"]
+        let banned = ["as an ai", "as a language model",
+                      "i cannot assist", "i can't assist",
+                      "i cannot help with", "i can't help with",
+                      "i'm not able to",
+                      "here's a translation", "here is the translation",
+                      "translated version:"]
         if banned.contains(where: { lower.contains($0) }) { return false }
 
         let greek = text.unicodeScalars.filter {

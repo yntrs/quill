@@ -15,6 +15,9 @@ DEST="$HOME/Applications/$APP_NAME.app"
 echo "→ compiling"
 rm -rf "$BUILD"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+if [ -f Resources/AppIcon.icns ]; then
+  cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+fi
 
 # Universal: Apple Silicon AND Intel. Building arm64-only means every Intel Mac
 # gets an app that refuses to launch, with no useful error.
@@ -26,6 +29,7 @@ for ARCH in arm64 x86_64; do
     -target "$ARCH-apple-macos12.0" \
     -sdk "$SDK" \
     -framework Cocoa -framework AVFoundation -framework QuartzCore -framework Speech \
+    -framework ServiceManagement \
     Sources/*.swift \
     -o "$BUILD/$APP_NAME-$ARCH"
 done
@@ -43,6 +47,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleExecutable</key><string>$APP_NAME</string>
   <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
   <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$VERSION</string>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
