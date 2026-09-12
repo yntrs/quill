@@ -45,34 +45,34 @@ enum Defaults {
         UserDefaults.standard.register(defaults: [
             language: "el",
             cornerButton: false,
-            sessionBar: false,
+            sessionBar: true,
             insertAtEnd: true,
             clickToInsert: true,
             requireTextField: true,
             trigger: Trigger.control.rawValue,
             singleTap: true,
-            stopPhrase: true,
+            stopPhrase: false,
             pauseSeconds: 5.0,
             // Greek STT often misses accents / small slips — polish cleans those up.
             polish: true,
-            translate: TranslateMode.off.rawValue,
+            translate: TranslateMode.elToEn.rawValue,
             lastTranslate: TranslateMode.elToEn.rawValue,
-            translateDoubleTap: false,
+            translateDoubleTap: true,
             keepHistory: true,
             notifyUpdates: true,
         ])
-        // Personal build: Greek speech. Translate stays Off until a double-tap
-        // (that tap uses Greek → English). A single tap must not start Translate.
+        // Personal build: every launch, including the first, starts the same.
         UserDefaults.standard.set("el", forKey: language)
-        UserDefaults.standard.set(TranslateMode.off.rawValue, forKey: translate)
+        UserDefaults.standard.set(TranslateMode.elToEn.rawValue, forKey: translate)
         UserDefaults.standard.set(TranslateMode.elToEn.rawValue, forKey: lastTranslate)
+        UserDefaults.standard.set(true, forKey: translateDoubleTap)
+        UserDefaults.standard.set(true, forKey: sessionBar)
+        UserDefaults.standard.set(false, forKey: cornerButton)
         UserDefaults.standard.set(true, forKey: polish)
         if !UserDefaults.standard.bool(forKey: greekDefaultApplied) {
             UserDefaults.standard.set(true, forKey: greekDefaultApplied)
         }
         if !UserDefaults.standard.bool(forKey: overlayDefaultApplied) {
-            UserDefaults.standard.set(false, forKey: cornerButton)
-            UserDefaults.standard.set(false, forKey: sessionBar)
             UserDefaults.standard.set(true, forKey: overlayDefaultApplied)
         }
     }
