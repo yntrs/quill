@@ -11,6 +11,7 @@ enum Trigger: String, CaseIterable {
     case control
     case fnGlobe
     case f5
+    case shortcut
 
     var title: String {
         switch self {
@@ -19,13 +20,22 @@ enum Trigger: String, CaseIterable {
         case .control:      return "Control ⌃"
         case .fnGlobe:      return "🌐 (fn)"
         case .f5:           return "F5"
+        case .shortcut:
+            if let saved = Shortcut.saved { return saved.display }
+            return "Keyboard shortcut…"
         }
     }
 
     /// How to describe the gesture, given the single/double setting.
     func gesture(singleTap: Bool) -> String {
-        guard self != .f5 else { return "Press F5" }
-        return (singleTap ? "Tap " : "Double-tap ") + title
+        switch self {
+        case .f5: return "Press F5"
+        case .shortcut:
+            let name = Shortcut.saved?.display ?? "keyboard shortcut"
+            return singleTap ? name : "Double-press \(name)"
+        default:
+            return (singleTap ? "Tap " : "Double-tap ") + title
+        }
     }
 
     var shortTitle: String {
@@ -35,6 +45,7 @@ enum Trigger: String, CaseIterable {
         case .control:      return "⌃"
         case .fnGlobe:      return "🌐"
         case .f5:           return "F5"
+        case .shortcut:     return Shortcut.saved?.display ?? "Shortcut"
         }
     }
 
@@ -47,7 +58,7 @@ enum Trigger: String, CaseIterable {
         case .rightOption:  return ([61], .maskAlternate)
         case .control:      return ([59, 62], .maskControl)
         case .fnGlobe:      return ([63], .maskSecondaryFn)
-        case .f5:           return nil
+        case .f5, .shortcut: return nil
         }
     }
 }
@@ -75,6 +86,14 @@ final class DoubleTapRightCommand {
     private var loggedFirstEvent = false
 
     var trigger: Trigger = .rightCommand
+    var shortcut: Shortcut?
+
+    /// When set, the next usable key combo is captured instead of firing the trigger.
+    var capturingShortcut = false
+    var onShortcutCaptured: ((Shortcut) -> Void)?
+    var onShortcutCaptureCancelled: (() -> Void)?
+    var onShortcutCaptureMessage: ((String) -> Void)?
+    private var swallowKey: Int64?
 
     /// Fire on a single quick tap rather than a double-tap. Safe because a tap is
     /// only counted when the key goes down and back up with no other key pressed
@@ -224,6 +243,15 @@ final class DoubleTapRightCommand {
         if type == .keyDown || type == .keyUp {
             let code = event.getIntegerValueField(.keyboardEventKeycode)
 
+            if capturingShortcut {
+                return handleShortcutCapture(type, event, code: code)
+            }
+
+            if type == .keyUp, swallowKey == code {
+                swallowKey = nil
+                return true
+            }
+
             // Only meaningful when Input Monitoring happens to be granted; the
             // keyState poll above covers everyone else.
             if type == .keyDown, code == Self.escapeKeyCode, cancelTimer != nil, !escapeWasDown {
@@ -234,6 +262,13 @@ final class DoubleTapRightCommand {
             let bareKey = event.flags
                 .intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift])
                 .isEmpty
+
+            if trigger == .shortcut, type == .keyDown, let shortcut, shortcut.matches(event) {
+                if event.getIntegerValueField(.keyboardEventAutorepeat) != 0 { return true }
+                swallowKey = code
+                noteTap()
+                return true
+            }
 
             if trigger == .f5, type == .keyDown, code == Self.f5KeyCode, bareKey {
                 noteTap()
@@ -263,6 +298,7 @@ final class DoubleTapRightCommand {
 
         // Globe/fn is handled only as keyDown/keyUp. flagsChanged for the same
         // press used to look like a second tap and immediately stop recording.
+        if capturingShortcut { return false }
         guard trigger != .fnGlobe else { return false }
         guard type == .flagsChanged, let spec = trigger.modifier else { return false }
 
@@ -316,6 +352,33 @@ final class DoubleTapRightCommand {
             noteTap()
         }
         return false
+    }
+
+    /// Swallow keys while the user is assigning a shortcut, so they do not type
+    /// into the focused field. Esc with no modifiers cancels.
+    private func handleShortcutCapture(_ type: CGEventType, _ event: CGEvent, code: Int64) -> Bool {
+        if type == .keyUp { return true }
+        guard type == .keyDown else { return false }
+        if Shortcut.isModifierKey(code) { return false }
+
+        let combo = Shortcut.from(event: event)
+        let bareEsc = code == Self.escapeKeyCode && combo.flags.isEmpty
+        if bareEsc {
+            capturingShortcut = false
+            DispatchQueue.main.async { [weak self] in self?.onShortcutCaptureCancelled?() }
+            return true
+        }
+        if event.getIntegerValueField(.keyboardEventAutorepeat) != 0 { return true }
+        guard combo.isUsable else {
+            DispatchQueue.main.async { [weak self] in
+                self?.onShortcutCaptureMessage?("Add ⌘, ⌥, ⌃ or ⇧ — or use an F-key")
+            }
+            return true
+        }
+        capturingShortcut = false
+        swallowKey = code
+        DispatchQueue.main.async { [weak self] in self?.onShortcutCaptured?(combo) }
+        return true
     }
 
     private func handleFnKey(_ type: CGEventType) {

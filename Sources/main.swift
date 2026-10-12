@@ -85,7 +85,9 @@ enum Defaults {
     }
 
     static var currentTrigger: Trigger {
-        Trigger(rawValue: UserDefaults.standard.string(forKey: trigger) ?? "") ?? .rightCommand
+        let value = Trigger(rawValue: UserDefaults.standard.string(forKey: trigger) ?? "") ?? .rightCommand
+        if value == .shortcut, Shortcut.saved == nil { return .rightCommand }
+        return value
     }
 
     static var currentTranslate: TranslateMode {
@@ -200,11 +202,20 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         hud.install()
 
         hotkey.trigger = Defaults.currentTrigger
+        hotkey.shortcut = Shortcut.saved
         applyTapMode()
         hotkey.onTrigger = { [weak self] in self?.handleTriggerTap(double: false) }
         hotkey.onDoubleTrigger = { [weak self] in self?.handleTriggerTap(double: true) }
         hotkey.onClickAnywhere = { [weak self] point in self?.handleClickAnywhere(at: point) }
         hotkey.onCancel = { [weak self] in self?.cancelSession() }
+        hotkey.onShortcutCaptured = { [weak self] shortcut in self?.applyCapturedShortcut(shortcut) }
+        hotkey.onShortcutCaptureCancelled = { [weak self] in
+            self?.hud.apply(.notice("Shortcut unchanged"))
+            self?.hud.collapse(after: 2)
+        }
+        hotkey.onShortcutCaptureMessage = { [weak self] message in
+            self?.hud.apply(.notice(message))
+        }
 
         isTrusted = Inserter.isTrusted
         let inputMonitoring = IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)
@@ -485,6 +496,10 @@ final class QuillApp: NSObject, NSApplicationDelegate {
                 item.toolTip = "F5 is the system Dictation key. It only reaches Quill if "
                     + "\"Use F1, F2 as standard function keys\" is on in Keyboard settings."
             }
+            if option == .shortcut {
+                item.toolTip = "Press this to record a shortcut (⌘⌥⌃⇧ + a key, or an F-key). "
+                    + "Quill swallows that combo so it does not type into the field."
+            }
             triggerMenu.addItem(item)
         }
         triggerMenu.addItem(.separator())
@@ -668,6 +683,10 @@ final class QuillApp: NSObject, NSApplicationDelegate {
     @objc private func setTrigger(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String,
               let option = Trigger(rawValue: raw) else { return }
+        if option == .shortcut {
+            beginShortcutCapture()
+            return
+        }
         UserDefaults.standard.set(raw, forKey: Defaults.trigger)
         hotkey.trigger = option
         Log.write("trigger set to \(option.rawValue)")
@@ -684,6 +703,23 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         }
 
         hud.apply(.notice("Trigger: \(option.gesture(singleTap: Defaults.bool(Defaults.singleTap)))"))
+        hud.collapse(after: 2.5)
+    }
+
+    private func beginShortcutCapture() {
+        hotkey.capturingShortcut = true
+        hud.apply(.notice("Press the shortcut — Esc to cancel"))
+        Log.write("capturing keyboard shortcut")
+    }
+
+    private func applyCapturedShortcut(_ shortcut: Shortcut) {
+        shortcut.save()
+        UserDefaults.standard.set(Trigger.shortcut.rawValue, forKey: Defaults.trigger)
+        hotkey.shortcut = shortcut
+        hotkey.trigger = .shortcut
+        applyTapMode()
+        Log.write("trigger set to shortcut \(shortcut.display)")
+        hud.apply(.notice("Trigger: \(shortcut.display)"))
         hud.collapse(after: 2.5)
     }
 
