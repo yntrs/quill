@@ -27,6 +27,9 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
     private var bestText = ""
     private var doneTimer: Timer?
     private var languageId = "el-GR"
+    /// Plain Greek dictation only. When false (double-tap translate), the
+    /// original smaller hint list is used and nothing else changes.
+    var usePlainEnglishHints = false
     /// Bumps on every new recognition task so a dying task's late error cannot
     /// restart us in a loop or wipe the next utterance.
     private var generation = 0
@@ -99,7 +102,12 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
         request.taskHint = .dictation
-        request.contextualStrings = Self.mixedLanguageHints
+        if usePlainEnglishHints, languageId.hasPrefix("el") {
+            request.contextualStrings = Self.plainDictationHints
+            Log.write("Apple STT: plain English hints \(Self.plainDictationHints.count)")
+        } else {
+            request.contextualStrings = Self.mixedLanguageHints
+        }
         if recognizer.supportsOnDeviceRecognition {
             request.requiresOnDeviceRecognition = true
             Log.write("Apple STT: on-device \(languageId) committed=\(committed.count)ch")
@@ -304,16 +312,22 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
     }
 
     /// Same utterance growing/revising vs a brand-new sentence after a pause.
+    /// "Να κάνουμε" then "να…" must NOT count as a revision: the new phrase
+    /// starts with a word the previous one already used, and the old text was
+    /// being thrown away.
     private static func isContinuation(old: String, new: String) -> Bool {
-        if new.hasPrefix(old) || old.hasPrefix(new) { return true }
-        let ol = old.lowercased(), nl = new.lowercased()
-        if nl.hasPrefix(ol) || ol.hasPrefix(nl) { return true }
-        let n = min(old.count, new.count, 20)
-        if n >= 8, old.prefix(n) == new.prefix(n) { return true }
-
         let ow = foldedTokens(old)
         let nw = foldedTokens(new)
-        if commonPrefixCount(ow, nw) >= 3 { return true }
+        if ow.isEmpty || nw.isEmpty { return true }
+
+        let pref = commonPrefixCount(ow, nw)
+        // Grew in place: "Να" → "Να κάνουμε".
+        if nw.count >= ow.count, pref == ow.count { return true }
+        // Almost the same phrase, one word dropped at the end. A one-word
+        // restart ("Να κάνουμε" → "να") is a new sentence and must be kept.
+        if ow.count > nw.count, pref == nw.count, nw.count >= 2, ow.count - nw.count <= 1 {
+            return true
+        }
         if isNearRevision(ow, nw) { return true }
 
         // On long phrases Apple revises the opening ("Και συνήθως…" →
@@ -662,6 +676,21 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
         if hints.count > 100 { hints = Array(hints.prefix(100)) }
         return hints
     }
+
+    /// Apple accepts about 100 contextual strings. Used only for plain Greek
+    /// dictation. Words outside this list stay however Apple wrote them.
+    private static let plainDictationHints: [String] = [
+        "hey", "Grok", "Quill", "Mac", "macOS", "MacBook", "iMac", "iPhone", "iPad", "iOS",
+        "Swift", "Xcode", "GitHub", "Google", "WhatsApp", "email", "Slack", "Zoom", "Teams", "Discord",
+        "Control", "Command", "Option", "Escape", "Terminal", "Finder", "Safari", "Chrome", "YouTube", "API",
+        "JSON", "Python", "JavaScript", "TypeScript", "Docker", "OpenAI", "Claude", "Windows", "Linux", "Bluetooth",
+        "Wi-Fi", "USB", "PDF", "URL", "password", "login", "logout", "update", "translate", "trigger",
+        "timeout", "log", "build", "fix", "bug", "commit", "push", "pull", "branch", "merge",
+        "deploy", "server", "cloud", "prompt", "model", "chat", "message", "okay", "meeting", "review",
+        "file", "folder", "link", "click", "app", "download", "upload", "desktop", "screenshot", "calendar",
+        "deadline", "issue", "Notion", "Figma", "nostr", "Nostrich", "Primal", "Bitcoin", "browser", "keyboard",
+        "laptop", "AirPods", "settings", "account", "token", "backup", "restart", "error", "warning", "debug",
+    ]
 
     private static let englishContextHints: [String] = [
         "hey", "Grok", "Grok Build", "Quill", "Mac", "macOS", "MacBook", "iPhone", "iPad",

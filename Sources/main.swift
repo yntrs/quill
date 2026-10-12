@@ -22,6 +22,7 @@ enum Defaults {
     static let clickToInsert = "clickToInsert"
     static let requireTextField = "requireTextField"
     static let trigger = "trigger"
+    static let trigger2 = "trigger2"
     static let singleTap = "singleTap"
     static let didShowSetup = "didShowSetup"
     static let stopPhrase = "stopPhrase"
@@ -50,6 +51,7 @@ enum Defaults {
             clickToInsert: true,
             requireTextField: true,
             trigger: Trigger.control.rawValue,
+            trigger2: "",
             singleTap: true,
             stopPhrase: false,
             pauseSeconds: 5.0,
@@ -87,6 +89,15 @@ enum Defaults {
     static var currentTrigger: Trigger {
         let value = Trigger(rawValue: UserDefaults.standard.string(forKey: trigger) ?? "") ?? .rightCommand
         if value == .shortcut, Shortcut.saved == nil { return .rightCommand }
+        return value
+    }
+
+    /// Empty string means no second trigger.
+    static var secondTrigger: Trigger? {
+        guard let raw = UserDefaults.standard.string(forKey: trigger2), !raw.isEmpty,
+              let value = Trigger(rawValue: raw) else { return nil }
+        if value == .shortcut, Shortcut.saved == nil { return nil }
+        if value == currentTrigger { return nil }
         return value
     }
 
@@ -202,12 +213,18 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         hud.install()
 
         hotkey.trigger = Defaults.currentTrigger
+        hotkey.trigger2 = Defaults.secondTrigger
         hotkey.shortcut = Shortcut.saved
         applyTapMode()
         hotkey.onTrigger = { [weak self] in self?.handleTriggerTap(double: false) }
         hotkey.onDoubleTrigger = { [weak self] in self?.handleTriggerTap(double: true) }
         hotkey.onClickAnywhere = { [weak self] point in self?.handleClickAnywhere(at: point) }
         hotkey.onCancel = { [weak self] in self?.cancelSession() }
+        hotkey.onCommit = { [weak self] in
+            guard let self, self.isRecording else { return }
+            Log.write("return → insert")
+            self.stopSession(reason: .hotkey)
+        }
         hotkey.onShortcutCaptured = { [weak self] shortcut in self?.applyCapturedShortcut(shortcut) }
         hotkey.onShortcutCaptureCancelled = { [weak self] in
             self?.hud.apply(.notice("Shortcut unchanged"))
@@ -383,8 +400,15 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         toggleItem.target = self
         menu.addItem(toggleItem)
 
-        let hint = NSMenuItem(title: "\(Defaults.currentTrigger.gesture(singleTap: Defaults.bool(Defaults.singleTap))) anywhere",
-                              action: nil, keyEquivalent: "")
+        let singleOn = Defaults.bool(Defaults.singleTap)
+        let primaryGesture = Defaults.currentTrigger.gesture(singleTap: singleOn)
+        let hintTitle: String
+        if let second = Defaults.secondTrigger {
+            hintTitle = "\(primaryGesture) or \(second.gesture(singleTap: singleOn)) anywhere"
+        } else {
+            hintTitle = "\(primaryGesture) anywhere"
+        }
+        let hint = NSMenuItem(title: hintTitle, action: nil, keyEquivalent: "")
         hint.isEnabled = false
         menu.addItem(hint)
         menu.addItem(.separator())
@@ -487,18 +511,18 @@ final class QuillApp: NSObject, NSApplicationDelegate {
 
         let triggerMenu = NSMenu()
         let activeTrigger = Defaults.currentTrigger
+        let activeSecond = Defaults.secondTrigger
         for option in Trigger.allCases {
             let item = NSMenuItem(title: option.title, action: #selector(setTrigger(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = option.rawValue
-            item.state = (option == activeTrigger) ? .on : .off
+            item.state = (option == activeTrigger || option == activeSecond) ? .on : .off
             if option == .f5 {
                 item.toolTip = "F5 is the system Dictation key. It only reaches Quill if "
                     + "\"Use F1, F2 as standard function keys\" is on in Keyboard settings."
             }
             if option == .shortcut {
-                item.toolTip = "Press this to record a shortcut (⌘⌥⌃⇧ + a key, or an F-key). "
-                    + "Quill swallows that combo so it does not type into the field."
+                item.toolTip = "Tick two triggers. A shortcut is ⌘⌥⌃⇧ plus a key, or an F-key."
             }
             triggerMenu.addItem(item)
         }
@@ -683,44 +707,87 @@ final class QuillApp: NSObject, NSApplicationDelegate {
     @objc private func setTrigger(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String,
               let option = Trigger(rawValue: raw) else { return }
-        if option == .shortcut {
-            beginShortcutCapture()
+        let primary = Defaults.currentTrigger
+        let second = Defaults.secondTrigger
+        let on = option == primary || option == second
+
+        if on {
+            if option == primary {
+                guard let second else {
+                    hud.apply(.notice("Keep at least one trigger"))
+                    hud.collapse(after: 2)
+                    return
+                }
+                UserDefaults.standard.set(second.rawValue, forKey: Defaults.trigger)
+                UserDefaults.standard.set("", forKey: Defaults.trigger2)
+            } else {
+                UserDefaults.standard.set("", forKey: Defaults.trigger2)
+            }
+            syncTriggers()
+            announceTriggers()
             return
         }
-        UserDefaults.standard.set(raw, forKey: Defaults.trigger)
-        hotkey.trigger = option
-        Log.write("trigger set to \(option.rawValue)")
 
-        if option == .fnGlobe {
-            // A bare 🌐 press normally shows emoji or switches input source; that
-            // would fire twice on a double-tap. Point it at nothing.
-            UserDefaults.standard.set(0, forKey: "AppleFnUsageType")
-            let task = Process()
-            task.launchPath = "/usr/bin/defaults"
-            task.arguments = ["write", "com.apple.HIToolbox", "AppleFnUsageType", "-int", "0"]
-            try? task.run()
-            applyTapMode()
+        if option == .shortcut, Shortcut.saved == nil {
+            beginShortcutCapture(second: true)
+            return
         }
+        UserDefaults.standard.set(option.rawValue, forKey: Defaults.trigger2)
+        if option == .fnGlobe { silenceGlobeKey() }
+        syncTriggers()
+        Log.write("triggers \(Defaults.currentTrigger.rawValue) + \(Defaults.secondTrigger?.rawValue ?? "none")")
+        announceTriggers()
+    }
 
-        hud.apply(.notice("Trigger: \(option.gesture(singleTap: Defaults.bool(Defaults.singleTap)))"))
+    private func syncTriggers() {
+        hotkey.trigger = Defaults.currentTrigger
+        hotkey.trigger2 = Defaults.secondTrigger
+        applyTapMode()
+    }
+
+    private func announceTriggers() {
+        let single = Defaults.bool(Defaults.singleTap)
+        let text: String
+        if let second = Defaults.secondTrigger {
+            text = "\(Defaults.currentTrigger.gesture(singleTap: single)) and \(second.gesture(singleTap: single))"
+        } else {
+            text = Defaults.currentTrigger.gesture(singleTap: single)
+        }
+        hud.apply(.notice(text))
         hud.collapse(after: 2.5)
     }
 
-    private func beginShortcutCapture() {
+    private var shortcutCaptureIsSecond = false
+
+    private func beginShortcutCapture(second: Bool) {
+        shortcutCaptureIsSecond = second
         hotkey.capturingShortcut = true
         hud.apply(.notice("Press the shortcut — Esc to cancel"))
-        Log.write("capturing keyboard shortcut")
+        Log.write("capturing keyboard shortcut second=\(second)")
     }
 
     private func applyCapturedShortcut(_ shortcut: Shortcut) {
         shortcut.save()
-        UserDefaults.standard.set(Trigger.shortcut.rawValue, forKey: Defaults.trigger)
         hotkey.shortcut = shortcut
-        hotkey.trigger = .shortcut
-        applyTapMode()
-        Log.write("trigger set to shortcut \(shortcut.display)")
-        hud.apply(.notice("Trigger: \(shortcut.display)"))
-        hud.collapse(after: 2.5)
+        if shortcutCaptureIsSecond, Defaults.currentTrigger != .shortcut {
+            UserDefaults.standard.set(Trigger.shortcut.rawValue, forKey: Defaults.trigger2)
+        } else {
+            UserDefaults.standard.set(Trigger.shortcut.rawValue, forKey: Defaults.trigger)
+        }
+        shortcutCaptureIsSecond = false
+        syncTriggers()
+        Log.write("shortcut \(shortcut.display) triggers \(Defaults.currentTrigger.rawValue) + \(Defaults.secondTrigger?.rawValue ?? "none")")
+        announceTriggers()
+    }
+
+    private func silenceGlobeKey() {
+        // A bare 🌐 press normally shows emoji or switches input source; that
+        // would fire twice on a double-tap. Point it at nothing.
+        UserDefaults.standard.set(0, forKey: "AppleFnUsageType")
+        let task = Process()
+        task.launchPath = "/usr/bin/defaults"
+        task.arguments = ["write", "com.apple.HIToolbox", "AppleFnUsageType", "-int", "0"]
+        try? task.run()
     }
 
     @objc private func toggleSingleTap() {
@@ -937,6 +1004,7 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         let start: () -> Void = { [weak self] in
             guard let self else { return }
             let client = AppleSTTClient()
+            client.usePlainEnglishHints = Defaults.currentTranslate == .off
             self.wireTranscriber(client, creds: Auth.current(), language: "el",
                                  onEngineFailure: { [weak self] message in
                 guard let self else { return }

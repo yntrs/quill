@@ -86,7 +86,14 @@ final class DoubleTapRightCommand {
     private var loggedFirstEvent = false
 
     var trigger: Trigger = .rightCommand
+    /// Optional extra trigger. Both fire the same tap (shortcut and Right ⌥ together).
+    var trigger2: Trigger?
     var shortcut: Shortcut?
+
+    private var triggers: [Trigger] {
+        if let trigger2, trigger2 != trigger { return [trigger, trigger2] }
+        return [trigger]
+    }
 
     /// When set, the next usable key combo is captured instead of firing the trigger.
     var capturingShortcut = false
@@ -145,10 +152,15 @@ final class DoubleTapRightCommand {
 
     /// Escape pressed during a recording — the user wants this thrown away.
     var onCancel: () -> Void = {}
+    /// Return pressed during a recording — finish and insert, same as the trigger.
+    var onCommit: () -> Void = {}
 
     private static let escapeKeyCode: Int64 = 53
+    /// Return, and the keypad Enter.
+    private static let returnKeyCodes: [CGKeyCode] = [36, 76]
     private var cancelTimer: Timer?
     private var escapeWasDown = false
+    private var returnWasDown = false
 
     /// Escape is watched two ways, because either can be unavailable.
     ///
@@ -161,6 +173,7 @@ final class DoubleTapRightCommand {
         cancelTimer?.invalidate()
         cancelTimer = nil
         escapeWasDown = false
+        returnWasDown = false
         guard on else { return }
 
         cancelTimer = Timer.scheduledTimer(withTimeInterval: 0.04, repeats: true) { [weak self] _ in
@@ -171,6 +184,15 @@ final class DoubleTapRightCommand {
                 DispatchQueue.main.async { self.onCancel() }
             } else if !down {
                 self.escapeWasDown = false
+            }
+            let ret = Self.returnKeyCodes.contains {
+                CGEventSource.keyState(.combinedSessionState, key: $0)
+            }
+            if ret, !self.returnWasDown {
+                self.returnWasDown = true
+                DispatchQueue.main.async { self.onCommit() }
+            } else if !ret {
+                self.returnWasDown = false
             }
         }
     }
@@ -263,14 +285,26 @@ final class DoubleTapRightCommand {
                 .intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift])
                 .isEmpty
 
-            if trigger == .shortcut, type == .keyDown, let shortcut, shortcut.matches(event) {
+            if triggers.contains(.shortcut), type == .keyDown, let shortcut, shortcut.matches(event) {
                 if event.getIntegerValueField(.keyboardEventAutorepeat) != 0 { return true }
                 swallowKey = code
                 noteTap()
                 return true
             }
 
-            if trigger == .f5, type == .keyDown, code == Self.f5KeyCode, bareKey {
+            // While dictating, Return inserts the text. Swallow it so the field
+            // does not also get a newline. Outside a recording it passes through.
+            if cancelTimer != nil, Self.returnKeyCodes.contains(CGKeyCode(code)), bareKey {
+                if type == .keyDown, !returnWasDown {
+                    returnWasDown = true
+                    DispatchQueue.main.async { [weak self] in self?.onCommit() }
+                } else if type == .keyUp {
+                    returnWasDown = false
+                }
+                return true
+            }
+
+            if triggers.contains(.f5), type == .keyDown, code == Self.f5KeyCode, bareKey {
                 noteTap()
                 // Swallowed so macOS dictation does not also fire on the same press.
                 return true
@@ -279,7 +313,7 @@ final class DoubleTapRightCommand {
             // Globe/fn often arrives as keyDown/keyUp (not only flagsChanged).
             // Treating that as "another key" used to cancel the tap and broke
             // Translate ▸ double-tap when the trigger was 🌐.
-            if trigger == .fnGlobe, Self.fnKeyCodes.contains(code) {
+            if triggers.contains(.fnGlobe), Self.fnKeyCodes.contains(code) {
                 handleFnKey(type)
                 return true
             }
@@ -299,11 +333,13 @@ final class DoubleTapRightCommand {
         // Globe/fn is handled only as keyDown/keyUp. flagsChanged for the same
         // press used to look like a second tap and immediately stop recording.
         if capturingShortcut { return false }
-        guard trigger != .fnGlobe else { return false }
-        guard type == .flagsChanged, let spec = trigger.modifier else { return false }
+        let specs: [(keyCodes: Set<Int64>, flag: CGEventFlags)] = triggers.compactMap {
+            $0 == .fnGlobe ? nil : $0.modifier
+        }
+        guard type == .flagsChanged, !specs.isEmpty else { return false }
 
         let code = event.getIntegerValueField(.keyboardEventKeycode)
-        guard spec.keyCodes.contains(code) else {
+        guard let spec = specs.first(where: { $0.keyCodes.contains(code) }) else {
             // A different modifier joined in — this is a chord, not a tap.
             if Self.modifierKeyCodes.contains(code), !event.flags.isEmpty {
                 lastTapAt = 0
