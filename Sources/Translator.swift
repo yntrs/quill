@@ -47,8 +47,10 @@ enum TranslateMode: String, CaseIterable {
 
 enum Translator {
 
-    /// Quality over speed: this is the actual translation, not a tidy-up.
-    private static let model = "grok-4.5"
+    /// Double-tap dictation translation. Quality model.
+    private static let model = "grok-4.7"
+    /// Triple-click translation of text that is already written. Fast, no reasoning.
+    private static let fastModel = "grok-4.20-0309-non-reasoning"
     private static let endpoint = URL(string: "https://api.x.ai/v1/chat/completions")!
 
     private static let session: URLSession = {
@@ -77,6 +79,7 @@ enum Translator {
 
     /// `didTranslate` is false when we had to fall back to the original text.
     static func translate(_ text: String, mode: TranslateMode, token: String,
+                          fast: Bool = false,
                           completion: @escaping (_ text: String, _ didTranslate: Bool, _ failReason: String?) -> Void) {
         let original = text
         func giveUp(_ why: String) {
@@ -87,6 +90,8 @@ enum Translator {
         guard mode != .off else { return giveUp("off") }
         guard text.count >= 2 else { return giveUp("too short") }
 
+        let chosen = fast ? Self.fastModel : Self.model
+        Log.write("  translate model \(chosen)")
         func attempt(token: String, remainingRetries: Int) {
             var request = URLRequest(url: endpoint)
             request.httpMethod = "POST"
@@ -96,11 +101,11 @@ enum Translator {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             let outTokens = min(8000, max(2000, text.count))
             request.httpBody = try? JSONSerialization.data(withJSONObject: [
-                "model": model,
+                "model": chosen,
                 "temperature": 0.25,
                 "max_tokens": outTokens,
                 "messages": [
-                    ["role": "system", "content": instructions(for: mode)],
+                    ["role": "system", "content": instructions(for: mode, spoken: !fast)],
                     ["role": "user", "content": text],
                 ],
             ])
@@ -152,7 +157,7 @@ enum Translator {
         attempt(token: token, remainingRetries: 1)
     }
 
-    private static func instructions(for mode: TranslateMode) -> String {
+    private static func instructions(for mode: TranslateMode, spoken: Bool) -> String {
         let pair: String
         switch mode {
         case .off:
@@ -169,12 +174,22 @@ enum Translator {
                 """
         }
 
+        let apple = spoken ? """
+
+            The text comes from Apple dictation, not from a person typing. Apple often \
+            writes the same word or the same sentence two or three times by mistake, \
+            and it sometimes inserts a garbled word that is not a real word. \
+            Skip those duplicates. Do not translate a repeated copy. Drop words that \
+            are nonsense. Keep one clear sentence and translate only what the speaker \
+            meant, so the result reads well.
+            """ : ""
+
         return """
             You are a professional human translator, not a machine-translation engine \
             and not an assistant.
 
             \(pair)
-
+            \(apple)
             The input is speech-to-text. It may have recognition errors, missing Greek \
             accents, phonetic spellings of names, or English words written in Greek letters \
             (and the reverse). First infer what the speaker actually said. Then translate.
@@ -225,11 +240,16 @@ enum Translator {
             (0x0370...0x03FF).contains($0.value) || (0x1F00...0x1FFF).contains($0.value)
         }.count
         let latin = text.unicodeScalars.filter { CharacterSet.letters.contains($0) && $0.isASCII }.count
+        let words = text.split(whereSeparator: { $0.isWhitespace }).count
         switch mode {
         case .elToEn:
-            return latin >= greek
+            // A short name ("ultra pulse feed") may stay in Latin. A long
+            // result that is still mostly Greek was not translated.
+            if latin >= greek { return true }
+            return words <= 6
         case .enToEl:
-            return greek >= max(1, latin / 3)
+            if greek >= max(1, latin / 3) { return true }
+            return words <= 6
         case .off:
             return true
         }

@@ -198,8 +198,12 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
             bestText = committed
         } else if committed.isEmpty {
             bestText = livePartial
-        } else if livePartial.hasPrefix(committed) {
+        } else if Self.phraseHasPrefix(livePartial, committed) {
+            // "Πρόσφατα." then "Πρόσφατα όλες…" is the same phrase continuing.
+            // Joining them wrote the opening twice.
             bestText = livePartial
+        } else if Self.phraseHasPrefix(committed, livePartial) {
+            bestText = committed
         } else {
             bestText = Self.join(committed, livePartial)
         }
@@ -207,6 +211,21 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
         let snapshot = bestText
         guard !snapshot.isEmpty else { return }
         DispatchQueue.main.async { [weak self] in self?.onText(snapshot) }
+    }
+
+    /// Folded words, ignoring a trailing period. "Πρόσφατα." prefixes "Πρόσφατα όλες".
+    static func phraseHasPrefix(_ text: String, _ prefix: String) -> Bool {
+        let tw = foldedTokens(text)
+        let pw = foldedTokens(prefix)
+        guard !pw.isEmpty, tw.count >= pw.count else { return false }
+        return commonPrefixCount(tw, pw) == pw.count
+    }
+
+    /// Drop a phrase Apple sent twice, including a one-word sentence
+    /// ("Πρόσφατα. Πρόσφατα.") and a clause that is restated as it continues
+    /// ("Όλες οι συνομιλίες. Όλες οι συνομιλίες μου…").
+    static func cleaned(_ text: String) -> String {
+        collapseRepeated(text.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     private static func join(_ a: String, _ b: String) -> String {
@@ -460,8 +479,8 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
         while i < nw.count {
             var didCollapse = false
             let maxN = min(8, (nw.count - i) / 2)
-            if maxN >= 3 {
-                for n in stride(from: maxN, through: 3, by: -1) {
+            if maxN >= 1 {
+                for n in stride(from: maxN, through: 1, by: -1) {
                     let phrase = Array(nw[i..<(i + n)])
                     var j = i + n
                     var runs = 1
@@ -470,6 +489,11 @@ final class AppleSTTClient: NSObject, StreamingTranscriber {
                         j += n
                     }
                     guard runs >= 2 else { continue }
+                    // One or two words only count as a duplicate when the first
+                    // copy ended a sentence. "πολύ πολύ" stays. "Πρόσφατα. Πρόσφατα." does not.
+                    if n < 3, !parts[i + n - 1].contains(where: { ".!?;…".contains($0) }) {
+                        continue
+                    }
                     // Keep the last copy — it usually has the real punctuation.
                     let kept = Array(parts[(j - n)..<j])
                     parts = Array(parts[..<i]) + kept + Array(parts[j...])

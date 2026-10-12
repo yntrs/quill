@@ -139,6 +139,8 @@ final class DoubleTapRightCommand {
     var onTrigger: () -> Void = {}
     /// Second tap of the trigger while single-tap dictation is on.
     var onDoubleTrigger: () -> Void = {}
+    /// Third tap: translate the current selection. Does not start dictation.
+    var onTripleTrigger: () -> Void = {}
     /// When set, a lone tap waits briefly so a second tap can be told apart.
     var reportDoubleTap = false
     private var pendingSingle: DispatchWorkItem?
@@ -161,6 +163,8 @@ final class DoubleTapRightCommand {
     private var cancelTimer: Timer?
     private var escapeWasDown = false
     private var returnWasDown = false
+    /// While the translation panel is up, Escape is swallowed so it only closes that panel.
+    var swallowEscape = false
 
     /// Escape is watched two ways, because either can be unavailable.
     ///
@@ -274,16 +278,19 @@ final class DoubleTapRightCommand {
                 return true
             }
 
-            // Only meaningful when Input Monitoring happens to be granted; the
-            // keyState poll above covers everyone else.
-            if type == .keyDown, code == Self.escapeKeyCode, cancelTimer != nil, !escapeWasDown {
-                escapeWasDown = true
-                DispatchQueue.main.async { [weak self] in self?.onCancel() }
-                return false
-            }
             let bareKey = event.flags
                 .intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift])
                 .isEmpty
+
+            // Only meaningful when Input Monitoring happens to be granted; the
+            // keyState poll above covers everyone else.
+            if type == .keyDown, code == Self.escapeKeyCode, cancelTimer != nil, bareKey {
+                if !escapeWasDown {
+                    escapeWasDown = true
+                    DispatchQueue.main.async { [weak self] in self?.onCancel() }
+                }
+                return swallowEscape
+            }
 
             if triggers.contains(.shortcut), type == .keyDown, let shortcut, shortcut.matches(event) {
                 if event.getIntegerValueField(.keyboardEventAutorepeat) != 0 { return true }
@@ -435,9 +442,10 @@ final class DoubleTapRightCommand {
     }
 
     /// A completed bare tap. If `reportDoubleTap` is on, wait to see whether a
-    /// second tap follows; otherwise fire immediately as today.
+    /// second or third tap follows; otherwise fire immediately as today.
     private var lastNoteAt: CFTimeInterval = 0
     private var ignoreTapsUntil: CFTimeInterval = 0
+    private var stagedTaps = 0
     private func noteTap() {
         let now = CACurrentMediaTime()
         if now < ignoreTapsUntil { return }
@@ -446,28 +454,42 @@ final class DoubleTapRightCommand {
         lastNoteAt = now
         guard reportDoubleTap else {
             lastTapAt = 0
+            stagedTaps = 0
             pendingSingle?.cancel()
             pendingSingle = nil
             ignoreTapsUntil = now + 0.55
             DispatchQueue.main.async { [weak self] in self?.onTrigger() }
             return
         }
-        if lastTapAt > 0, now - lastTapAt < window {
-            lastTapAt = 0
-            pendingSingle?.cancel()
-            pendingSingle = nil
-            ignoreTapsUntil = now + 0.55
-            DispatchQueue.main.async { [weak self] in self?.onDoubleTrigger() }
-            return
+        if lastTapAt == 0 || now - lastTapAt >= window {
+            stagedTaps = 1
+        } else {
+            stagedTaps += 1
         }
         lastTapAt = now
         pendingSingle?.cancel()
+
+        if stagedTaps >= 3 {
+            stagedTaps = 0
+            lastTapAt = 0
+            pendingSingle = nil
+            ignoreTapsUntil = now + 0.55
+            DispatchQueue.main.async { [weak self] in self?.onTripleTrigger() }
+            return
+        }
+
+        let count = stagedTaps
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
+            self.stagedTaps = 0
             self.lastTapAt = 0
             self.pendingSingle = nil
             self.ignoreTapsUntil = CACurrentMediaTime() + 0.55
-            self.onTrigger()
+            if count >= 2 {
+                self.onDoubleTrigger()
+            } else {
+                self.onTrigger()
+            }
         }
         pendingSingle = work
         DispatchQueue.main.asyncAfter(deadline: .now() + window, execute: work)

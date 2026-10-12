@@ -55,8 +55,12 @@ enum VoiceCommands {
     }
 
     /// Everything a spoken command should never leave behind.
+    /// "αυτά" is an ordinary Greek word. It is removed only when
+    /// Stop when I say "that's it" is turned on.
     static func stripAll(_ text: String) -> String {
-        stripStopPhrase(strip(text))
+        let body = strip(text)
+        guard UserDefaults.standard.bool(forKey: "stopPhrase") else { return body }
+        return stripStopPhrase(body)
     }
 
     /// The transcript with any command phrase taken out.

@@ -148,6 +148,8 @@ final class QuillApp: NSObject, NSApplicationDelegate {
     private var lastActivityText: String?
     private var noiseFloor: Float = 0.02
     private var capturedSelection: Inserter.Selection?
+    /// Selection plus its translation, waiting for Replace text.
+    private var pendingReplacement: (selection: Inserter.Selection, text: String)?
     /// Translate ran and failed — insert the original and say so, instead of
     /// leaving the HUD on "Translating" as if nothing happened.
     private var translateFailed = false
@@ -197,8 +199,11 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
         buildStatusItem()
 
+        hud.onReplace = { [weak self] in self?.replaceSelectedText() }
+        hud.onOfferClosed = { [weak self] in self?.closeTranslationOffer() }
         hud.onClick = { [weak self] in
             guard let self else { return }
+            if self.hud.isOfferingReplace { return }
             // Without Accessibility the keyboard trigger is dead and only this pill
             // works — which reads as "the shortcut is broken". Make the pill the
             // route to fixing it rather than a dead end.
@@ -218,8 +223,16 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         applyTapMode()
         hotkey.onTrigger = { [weak self] in self?.handleTriggerTap(double: false) }
         hotkey.onDoubleTrigger = { [weak self] in self?.handleTriggerTap(double: true) }
+        hotkey.onTripleTrigger = { [weak self] in self?.translateSelectedText() }
         hotkey.onClickAnywhere = { [weak self] point in self?.handleClickAnywhere(at: point) }
-        hotkey.onCancel = { [weak self] in self?.cancelSession() }
+        hotkey.onCancel = { [weak self] in
+            guard let self else { return }
+            if self.hud.isOfferingReplace {
+                self.closeTranslationOffer()
+                return
+            }
+            self.cancelSession()
+        }
         hotkey.onCommit = { [weak self] in
             guard let self, self.isRecording else { return }
             Log.write("return → insert")
@@ -417,7 +430,7 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         do {
             let recent = NSMenu()
             recent.autoenablesItems = false
-            for (index, entry) in history.prefix(8).enumerated() {
+            for (index, entry) in history.prefix(50).enumerated() {
                 let title = entry.count > 60 ? String(entry.prefix(60)) + "…" : entry
                 let item = NSMenuItem(title: title, action: #selector(copyHistory(_:)), keyEquivalent: "")
                 item.target = self
@@ -921,6 +934,220 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         isRecording ? stopSession(reason: .hotkey) : startSession()
     }
 
+    /// Triple-click: translate the highlighted text. Greek goes to English,
+    /// English goes to Greek. Nothing is written until Replace text.
+    private func translateSelectedText() {
+        guard !isRecording else {
+            stopSession(reason: .hotkey)
+            return
+        }
+        guard Inserter.isTrusted else {
+            hud.apply(.notice("Turn on Accessibility so Quill can read the selection"))
+            hud.collapse(after: 3)
+            setup.show()
+            return
+        }
+        guard let creds = Auth.current() else {
+            hud.apply(.notice("Sign in to Grok to translate"))
+            hud.collapse(after: 3)
+            return
+        }
+        if let selection = Inserter.captureSelection() {
+            beginSelectionTranslation(selection, token: creds.token)
+            return
+        }
+        hud.update(translateCaption: "Translating")
+        hud.apply(.thinking)
+        hud.update(text: "")
+        Inserter.copySelection { [weak self] selection in
+            guard let self else { return }
+            guard let selection else {
+                self.hud.apply(.notice("Select the text to translate"))
+                self.hud.collapse(after: 2)
+                return
+            }
+            self.beginSelectionTranslation(selection, token: creds.token)
+        }
+    }
+
+    private func beginSelectionTranslation(_ selection: Inserter.Selection, token: String) {
+        let chunks = languageChunks(selection.text)
+        if chunks.count >= 2 {
+            beginMixedTranslation(selection, chunks: chunks, token: token)
+            return
+        }
+        let mode: TranslateMode = selectionLooksGreek(selection.text) ? .elToEn : .enToEl
+        Log.write("triple-tap translate \(mode.rawValue) \(selection.text.utf16.count) chars")
+        pendingReplacement = nil
+        hud.update(translateCaption: mode.hudCaption)
+        hud.apply(.thinking)
+        hud.update(text: "")
+        Translator.translate(selection.text, mode: mode, token: token, fast: true) { [weak self] text, ok, reason in
+            guard let self else { return }
+            guard ok else {
+                self.hud.apply(.notice(reason ?? "Translation failed"))
+                self.hud.collapse(after: 3)
+                return
+            }
+            self.showTranslationOffer(selection, text: text, caption: mode.hudCaption)
+        }
+    }
+
+    /// Selected text has both Greek and English blocks. Translate each block
+    /// the other way and show both in one panel, in the same order.
+    private func beginMixedTranslation(_ selection: Inserter.Selection,
+                                      chunks: [(greek: Bool, text: String)],
+                                      token: String) {
+        Log.write("triple-tap mixed translate \(chunks.count) blocks")
+        pendingReplacement = nil
+        hud.update(translateCaption: "Greek ↔ English")
+        hud.apply(.thinking)
+        hud.update(text: "")
+        var results = Array(repeating: "", count: chunks.count)
+        var failure: String?
+        let group = DispatchGroup()
+        for (index, chunk) in chunks.enumerated() {
+            let mode: TranslateMode = chunk.greek ? .elToEn : .enToEl
+            group.enter()
+            Translator.translate(chunk.text, mode: mode, token: token, fast: true) { text, ok, reason in
+                if ok {
+                    results[index] = text
+                } else if failure == nil {
+                    failure = reason
+                }
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) { [weak self] in
+            guard let self else { return }
+            let parts = zip(chunks, results).compactMap { _, text -> String? in
+                guard !text.isEmpty else { return nil }
+                return text
+            }
+            guard !parts.isEmpty else {
+                self.hud.apply(.notice(failure ?? "Translation failed"))
+                self.hud.collapse(after: 3)
+                return
+            }
+            self.showTranslationOffer(selection, text: parts.joined(separator: "\n\n"), caption: "Greek ↔ English")
+        }
+    }
+
+    private func showTranslationOffer(_ selection: Inserter.Selection, text: String, caption: String?) {
+        pendingReplacement = (selection, text)
+        remember(text)
+        hud.update(translateCaption: caption)
+        hud.apply(.offerReplace(text))
+        hotkey.swallowEscape = true
+        hotkey.watchForCancel(true)
+    }
+
+    /// Splits wherever the letters change script, even in the same paragraph.
+    /// A copied selection often has no newline between the English and the Greek.
+    private func languageChunks(_ text: String) -> [(greek: Bool, text: String)] {
+        var chunks: [(greek: Bool, text: String)] = []
+        var greek: Bool?
+        var buffer = ""
+
+        func flush() {
+            let trimmed = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
+            buffer = ""
+            guard !trimmed.isEmpty, let greek else { return }
+            if let last = chunks.indices.last, chunks[last].greek == greek {
+                chunks[last].text += " " + trimmed
+            } else {
+                chunks.append((greek: greek, text: trimmed))
+            }
+        }
+
+        for scalar in text.unicodeScalars {
+            let kind = scriptKind(scalar)
+            if kind == .other {
+                buffer.unicodeScalars.append(scalar)
+                continue
+            }
+            let isGreek = kind == .greek
+            if greek == nil {
+                greek = isGreek
+                buffer.unicodeScalars.append(scalar)
+                continue
+            }
+            if isGreek == greek {
+                buffer.unicodeScalars.append(scalar)
+            } else {
+                flush()
+                greek = isGreek
+                buffer.unicodeScalars.append(scalar)
+            }
+        }
+        flush()
+
+        // A one-word name ("Day") stays with the sentence around it.
+        chunks = absorbShortChunks(chunks)
+        let both = chunks.contains { $0.greek } && chunks.contains { !$0.greek }
+        return both ? chunks : []
+    }
+
+    private enum ScriptKind { case greek, latin, other }
+
+    private func scriptKind(_ scalar: Unicode.Scalar) -> ScriptKind {
+        if (0x0370...0x03FF).contains(scalar.value) || (0x1F00...0x1FFF).contains(scalar.value) {
+            return .greek
+        }
+        if CharacterSet.letters.contains(scalar), scalar.isASCII { return .latin }
+        return .other
+    }
+
+    private func absorbShortChunks(_ chunks: [(greek: Bool, text: String)]) -> [(greek: Bool, text: String)] {
+        guard chunks.count >= 2 else { return chunks }
+        var out: [(greek: Bool, text: String)] = []
+        for chunk in chunks {
+            let letters = scriptCounts(chunk.text).greek + scriptCounts(chunk.text).latin
+            if letters < 12, let last = out.indices.last {
+                out[last].text += " " + chunk.text
+            } else if letters < 12, out.isEmpty {
+                out.append(chunk)
+            } else {
+                out.append(chunk)
+            }
+        }
+        return out
+    }
+
+    private func scriptCounts(_ text: String) -> (greek: Int, latin: Int) {
+        var greek = 0
+        var latin = 0
+        for scalar in text.unicodeScalars {
+            if (0x0370...0x03FF).contains(scalar.value) || (0x1F00...0x1FFF).contains(scalar.value) {
+                greek += 1
+            } else if CharacterSet.letters.contains(scalar), scalar.isASCII {
+                latin += 1
+            }
+        }
+        return (greek, latin)
+    }
+
+    private func closeTranslationOffer() {
+        pendingReplacement = nil
+        hotkey.swallowEscape = false
+        if !isRecording { hotkey.watchForCancel(false) }
+        hud.apply(.idle)
+    }
+
+    private func replaceSelectedText() {
+        guard let pending = pendingReplacement else { return }
+        let selection = pending.selection
+        let text = pending.text
+        closeTranslationOffer()
+        Inserter.insert(text, atEndOfField: false, replacing: selection) { _ in }
+    }
+
+    private func selectionLooksGreek(_ text: String) -> Bool {
+        let counts = scriptCounts(text)
+        if counts.greek == 0, counts.latin == 0 { return true }
+        return counts.greek >= counts.latin
+    }
+
     private func handleClickAnywhere(at point: CGPoint) {
         let onPill = hud.contains(globalPoint: point)
         Log.write("click seen at \(Int(point.x)),\(Int(point.y)) — recording=\(isRecording) onPill=\(onPill)")
@@ -1405,7 +1632,8 @@ final class QuillApp: NSObject, NSApplicationDelegate {
             raw = backup
         }
         // The command phrase must never reach the target app.
-        let trimmed = VoiceCommands.stripAll(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = AppleSTTClient.cleaned(
+            VoiceCommands.stripAll(raw).trimmingCharacters(in: .whitespacesAndNewlines))
         // Quick tap with no live words: Apple invents "ναι" as isFinal even
         // when it also reports "no speech". Peak alone misses this (often ≥0.008).
         if !trimmed.isEmpty, !heardLiveText, isGhostFiller(trimmed) {
@@ -1463,7 +1691,7 @@ final class QuillApp: NSObject, NSApplicationDelegate {
         let setting = UserDefaults.standard.string(forKey: Defaults.language) ?? "el"
         let language = Polisher.effectiveLanguage(setting: setting, text: trimmed)
         Polisher.polish(trimmed, token: creds.token, language: language) { [weak self] result in
-            self?.completeSession(with: result)
+            self?.completeSession(with: AppleSTTClient.cleaned(result))
         }
     }
 
@@ -1597,9 +1825,12 @@ final class QuillApp: NSObject, NSApplicationDelegate {
     /// a way to wipe them.
     private func remember(_ text: String) {
         guard Defaults.bool(Defaults.keepHistory) else { return }
+        let item = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !item.isEmpty else { return }
         var history = UserDefaults.standard.stringArray(forKey: Defaults.history) ?? []
-        history.insert(text, at: 0)
-        UserDefaults.standard.set(Array(history.prefix(20)), forKey: Defaults.history)
+        if history.first == item { return }
+        history.insert(item, at: 0)
+        UserDefaults.standard.set(Array(history.prefix(100)), forKey: Defaults.history)
     }
 }
 

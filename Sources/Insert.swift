@@ -175,31 +175,177 @@ enum Inserter {
         let element: AXUIElement
         let range: CFRange
         let text: String
+        /// The app would not give us a range. Replace by pasting over the highlight.
+        var pasteOnly: Bool = false
     }
 
     static func captureSelection() -> Selection? {
-        guard isTrusted, let element = focusedElement() else { return nil }
+        guard isTrusted, let element = focusedElement() else {
+            Log.write("captured selection: no focused element")
+            return nil
+        }
+        if let found = selection(in: element) ?? selectionFromMarkers(in: element) { return found }
+        if let found = selectionInChildren(of: element, depth: 0) { return found }
+        var parent = parentElement(of: element)
+        var hops = 0
+        while let node = parent, hops < 8 {
+            if let found = selection(in: node) ?? selectionFromMarkers(in: node) { return found }
+            parent = parentElement(of: node)
+            hops += 1
+        }
+        Log.write("captured selection: AX had no selected text (\(axRole(element)))")
+        return nil
+    }
 
+    /// When Accessibility cannot see the highlight (web pages, some terminals),
+    /// copy it the way ⌘C would. The clipboard is put back.
+    static func copySelection(completion: @escaping (Selection?) -> Void) {
+        // The trigger key may still be down (⌥ or a shortcut). ⌘C while it is
+        // held is not a copy, so Greek selections in web views never arrived.
+        func whenModifiersUp(_ tries: Int) {
+            let held: [CGKeyCode] = [54, 55, 56, 58, 59, 61, 62]
+            let down = held.contains { CGEventSource.keyState(.combinedSessionState, key: $0) }
+            if down, tries > 0 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { whenModifiersUp(tries - 1) }
+                return
+            }
+            let pasteboard = NSPasteboard.general
+            let saved = snapshot(pasteboard)
+            let before = pasteboard.changeCount
+            pressCommandC()
+            pollCopiedText(pasteboard, before: before, saved: saved, tries: 10, completion: completion)
+        }
+        whenModifiersUp(20)
+    }
+
+    private static func pollCopiedText(_ pasteboard: NSPasteboard,
+                                       before: Int,
+                                       saved: [Item],
+                                       tries: Int,
+                                       completion: @escaping (Selection?) -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+            let copied = pastedString(pasteboard)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if pasteboard.changeCount != before, let copied, !copied.isEmpty {
+                restore(saved, to: pasteboard)
+                let element = focusedElement() ?? AXUIElementCreateSystemWide()
+                Log.write("captured selection: via copy \(copied.utf16.count) chars")
+                completion(Selection(element: element,
+                                     range: CFRange(location: 0, length: 0),
+                                     text: copied,
+                                     pasteOnly: true))
+                return
+            }
+            if tries > 0 {
+                pollCopiedText(pasteboard, before: before, saved: saved, tries: tries - 1, completion: completion)
+                return
+            }
+            restore(saved, to: pasteboard)
+            Log.write("captured selection: copy found nothing")
+            completion(nil)
+        }
+    }
+
+    private static func pastedString(_ pasteboard: NSPasteboard) -> String? {
+        if let text = pasteboard.string(forType: .string), !text.isEmpty { return text }
+        for type in pasteboard.types ?? [] {
+            if let text = pasteboard.string(forType: type), !text.isEmpty { return text }
+        }
+        return nil
+    }
+
+    private static func selection(in element: AXUIElement) -> Selection? {
         var textRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextAttribute as CFString, &textRef) == .success,
-              let selected = textRef as? String,
+        let textResult = AXUIElementCopyAttributeValue(element, kAXSelectedTextAttribute as CFString, &textRef)
+        guard textResult == .success,
+              let selected = axString(textRef),
               !selected.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else { return nil }
 
+        var range = CFRange(location: 0, length: selected.utf16.count)
+        var haveRange = false
         var rangeRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success,
-              let value = rangeRef, CFGetTypeID(value) == AXValueGetTypeID()
+        if AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success,
+           let value = rangeRef, CFGetTypeID(value) == AXValueGetTypeID() {
+            // swiftlint:disable:next force_cast
+            haveRange = AXValueGetValue(value as! AXValue, .cfRange, &range)
+        }
+        Log.write("captured selection: \(selected.utf16.count) chars range=\(haveRange) role=\(axRole(element))")
+        return Selection(element: element, range: range, text: selected, pasteOnly: !haveRange)
+    }
+
+    /// Safari and Chrome keep a web selection as text markers, not AXSelectedText.
+    /// That is why a Greek paragraph on a page was invisible while an English
+    /// text field was not.
+    private static func selectionFromMarkers(in element: AXUIElement) -> Selection? {
+        let markerAttr = "AXSelectedTextMarkerRange" as CFString
+        let stringAttr = "AXStringForTextMarkerRange" as CFString
+        var marker: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, markerAttr, &marker) == .success,
+              let marker
         else { return nil }
+        var stringRef: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(element, stringAttr, marker, &stringRef) == .success,
+              let selected = axString(stringRef),
+              !selected.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return nil }
+        Log.write("captured selection: markers \(selected.utf16.count) chars role=\(axRole(element))")
+        return Selection(element: element,
+                         range: CFRange(location: 0, length: selected.utf16.count),
+                         text: selected,
+                         pasteOnly: true)
+    }
 
-        var range = CFRange()
+    private static func axString(_ ref: CFTypeRef?) -> String? {
+        guard let ref else { return nil }
+        if let text = ref as? String { return text }
+        if let text = ref as? NSAttributedString { return text.string }
+        return nil
+    }
+
+    private static func selectionInChildren(of element: AXUIElement, depth: Int) -> Selection? {
+        guard depth < 3 else { return nil }
+        var childrenRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+              let children = childrenRef as? [AXUIElement]
+        else { return nil }
+        for child in children.prefix(30) {
+            if let found = selection(in: child) ?? selectionFromMarkers(in: child) { return found }
+            if let found = selectionInChildren(of: child, depth: depth + 1) { return found }
+        }
+        return nil
+    }
+
+    private static func parentElement(of element: AXUIElement) -> AXUIElement? {
+        var parentRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXParentAttribute as CFString, &parentRef) == .success,
+              let parent = parentRef, CFGetTypeID(parent) == AXUIElementGetTypeID()
+        else { return nil }
         // swiftlint:disable:next force_cast
-        guard AXValueGetValue(value as! AXValue, .cfRange, &range) else { return nil }
+        return (parent as! AXUIElement)
+    }
 
-        // Length only. This used to log the first 40 characters of the selection,
-        // which put whatever the user had highlighted — a password, a key, private
-        // text — into a plaintext file on disk.
-        Log.write("captured selection: \(range.length) chars")
-        return Selection(element: element, range: range, text: selected)
+    private static func axRole(_ element: AXUIElement) -> String {
+        var roleRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef) == .success,
+              let role = roleRef as? String
+        else { return "?" }
+        return role
+    }
+
+    private static func pressCommandC() {
+        let source = CGEventSource(stateID: .combinedSessionState)
+        source?.setLocalEventsFilterDuringSuppressionState(
+            [.permitLocalMouseEvents, .permitLocalKeyboardEvents],
+            state: .eventSuppressionStateSuppressionInterval)
+        let cKey: CGKeyCode = 8
+        guard let down = CGEvent(keyboardEventSource: source, virtualKey: cKey, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: cKey, keyDown: false)
+        else { return }
+        down.flags = .maskCommand
+        up.flags = .maskCommand
+        down.post(tap: .cgAnnotatedSessionEventTap)
+        up.post(tap: .cgAnnotatedSessionEventTap)
     }
 
     /// Puts the original selection back so it can be written over. Fails if focus
@@ -233,6 +379,13 @@ enum Inserter {
 
         // Replacing a selection wins over appending: the user highlighted
         // something specific and expects exactly that to be swapped out.
+        if let selection, selection.pasteOnly {
+            insertViaClipboard(payload) {
+                Log.write("  → replaced selection via paste")
+                completion(Outcome(method: isTrusted ? .clipboard : .blocked, app: app))
+            }
+            return
+        }
         if let selection, restore(selection) {
             let beforeReplace = focusedValue()
             if setSelectedText(payload), confirmLanded(payload, previous: beforeReplace) {

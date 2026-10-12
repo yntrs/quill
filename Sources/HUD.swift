@@ -14,6 +14,8 @@ final class HUD {
         case thinking
         case delivered(String?)
         case notice(String)
+        /// Translation of the current selection, with a Replace text button.
+        case offerReplace(String)
     }
 
     private var panel: NSPanel?
@@ -28,6 +30,13 @@ final class HUD {
 
 
     var onClick: () -> Void = {}
+    var onReplace: () -> Void = {}
+    var onOfferClosed: () -> Void = {}
+
+    var isOfferingReplace: Bool {
+        if case .offerReplace = state { return true }
+        return false
+    }
 
     /// When off, the pill is gone entirely while idle — the session bar still
     /// appears for the duration of a dictation, and the menu-bar item and trigger
@@ -51,6 +60,8 @@ final class HUD {
     func install() {
         _ = ensurePanel()
         content.onClick = { [weak self] in self?.onClick() }
+        content.onReplace = { [weak self] in self?.onReplace() }
+        content.onOfferClosed = { [weak self] in self?.onOfferClosed() }
         content.onMoved = { [weak self] rect in self?.snapToEdge(from: rect) }
         apply(.idle, animated: false)
     }
@@ -93,12 +104,16 @@ final class HUD {
         // completely transparent to the mouse. Otherwise it eats the very click
         // that is meant to choose where the words go — and it sits in the corner,
         // right on top of most apps' input boxes.
-        panel.ignoresMouseEvents = !compact
+        let offeringReplace: Bool
+        if case .offerReplace = newState { offeringReplace = true } else { offeringReplace = false }
+        // The replace button has to receive the click. Every other expanded
+        // state stays click-through so the user can choose where text lands.
+        panel.ignoresMouseEvents = !compact && !offeringReplace
 
         // Position it either way, so it is already in the right place the moment a
         // session starts — but stay hidden if the idle pill is switched off.
         let target = frame(compact: compact)
-        if shouldHide(compact: compact) {
+        if shouldHide(compact: compact), !offeringReplace {
             panel.setFrame(target, display: false)
             panel.orderOut(nil)
             return
@@ -256,7 +271,8 @@ final class HUD {
     }
 
     private func frame(compact: Bool) -> NSRect {
-        let size = compact ? compactSize : expandedSize
+        var size = compact ? compactSize : expandedSize
+        if case .offerReplace = state { size.height = content.offerPanelHeight }
         guard let visible = homeScreen?.visibleFrame else {
             return NSRect(origin: .zero, size: size)
         }
@@ -305,6 +321,8 @@ final class HUD {
 private final class HUDView: NSView {
 
     var onClick: () -> Void = {}
+    var onReplace: () -> Void = {}
+    var onOfferClosed: () -> Void = {}
     var onMoved: (NSRect) -> Void = { _ in }
 
     private let blur = NSVisualEffectView()
@@ -328,6 +346,15 @@ private final class HUDView: NSView {
     private let targetLabel = NSTextField(labelWithString: "")
     private let targetIcon = NSImageView()
     private let transcriptLabel = NSTextField(labelWithString: "")
+    /// Height the panel should use while a translation is on screen.
+    var offerPanelHeight: CGFloat = 132
+    private let replaceButton = NSButton(title: "Replace", target: nil, action: nil)
+    private let copyButton = NSButton(title: "Copy", target: nil, action: nil)
+    private let scroll = NSScrollView()
+    private let scrollText = NSTextField(wrappingLabelWithString: "")
+    private var transcriptToBottom: NSLayoutConstraint!
+    private var transcriptAboveReplace: NSLayoutConstraint!
+    private var scrollConstraints: [NSLayoutConstraint] = []
 
     private var hovering = false
     private var isIdle = true
@@ -439,6 +466,40 @@ private final class HUDView: NSView {
         transcriptLabel.wantsLayer = true
         transcriptLabel.translatesAutoresizingMaskIntoConstraints = false
 
+        replaceButton.isBordered = false
+        replaceButton.contentTintColor = NSColor.white.withAlphaComponent(0.92)
+        replaceButton.wantsLayer = true
+        replaceButton.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.14).cgColor
+        replaceButton.layer?.cornerRadius = 6
+        styleAction(replaceButton, title: "Replace")
+        replaceButton.target = self
+        replaceButton.action = #selector(replaceClicked)
+        replaceButton.isHidden = true
+        replaceButton.translatesAutoresizingMaskIntoConstraints = false
+
+        styleAction(copyButton, title: "Copy")
+        copyButton.target = self
+        copyButton.action = #selector(copyClicked)
+        copyButton.isHidden = true
+        copyButton.translatesAutoresizingMaskIntoConstraints = false
+
+        scrollText.font = .systemFont(ofSize: 13)
+        scrollText.textColor = NSColor.white.withAlphaComponent(0.96)
+        scrollText.isEditable = false
+        scrollText.isSelectable = true
+        scrollText.isBezeled = false
+        scrollText.drawsBackground = false
+        scrollText.lineBreakMode = .byWordWrapping
+        scrollText.maximumNumberOfLines = 0
+        scrollText.translatesAutoresizingMaskIntoConstraints = true
+        scroll.drawsBackground = false
+        scroll.borderType = .noBorder
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = false
+        scroll.documentView = scrollText
+        scroll.isHidden = true
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+
         // Labels must yield, always. A long transcript that resists compression
         // makes AppKit widen the window itself, which walked the panel off-screen.
         for label in [transcriptLabel, targetLabel, elapsedLabel] {
@@ -447,7 +508,7 @@ private final class HUDView: NSView {
             label.setContentHuggingPriority(.defaultLow, for: .horizontal)
         }
 
-        [dot, elapsedLabel, waveform, usageLabel, translateLabel, targetIcon, targetLabel, transcriptLabel].forEach(expanded.addSubview)
+        [dot, elapsedLabel, waveform, usageLabel, translateLabel, targetIcon, targetLabel, transcriptLabel, scroll, replaceButton, copyButton].forEach(expanded.addSubview)
         pin(expanded, to: self)
 
         NSLayoutConstraint.activate([
@@ -479,9 +540,27 @@ private final class HUDView: NSView {
 
             transcriptLabel.leadingAnchor.constraint(equalTo: expanded.leadingAnchor, constant: 16),
             transcriptLabel.trailingAnchor.constraint(equalTo: expanded.trailingAnchor, constant: -16),
-            transcriptLabel.bottomAnchor.constraint(equalTo: expanded.bottomAnchor, constant: -14),
             transcriptLabel.topAnchor.constraint(greaterThanOrEqualTo: dot.bottomAnchor, constant: 8),
+
+            replaceButton.leadingAnchor.constraint(equalTo: expanded.leadingAnchor, constant: 16),
+            replaceButton.bottomAnchor.constraint(equalTo: expanded.bottomAnchor, constant: -10),
+            replaceButton.heightAnchor.constraint(equalToConstant: 24),
+
+            copyButton.leadingAnchor.constraint(equalTo: replaceButton.trailingAnchor, constant: 8),
+            copyButton.centerYAnchor.constraint(equalTo: replaceButton.centerYAnchor),
+            copyButton.heightAnchor.constraint(equalTo: replaceButton.heightAnchor),
         ])
+
+        scrollConstraints = [
+            scroll.leadingAnchor.constraint(equalTo: expanded.leadingAnchor, constant: 12),
+            scroll.trailingAnchor.constraint(equalTo: expanded.trailingAnchor, constant: -12),
+            scroll.topAnchor.constraint(equalTo: dot.bottomAnchor, constant: 8),
+            scroll.bottomAnchor.constraint(equalTo: replaceButton.topAnchor, constant: -8),
+        ]
+
+        transcriptToBottom = transcriptLabel.bottomAnchor.constraint(equalTo: expanded.bottomAnchor, constant: -14)
+        transcriptAboveReplace = transcriptLabel.bottomAnchor.constraint(equalTo: replaceButton.topAnchor, constant: -8)
+        transcriptToBottom.isActive = true
 
         usageAfterDot = usageLabel.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 8)
         usageAfterElapsed = usageLabel.leadingAnchor.constraint(equalTo: elapsedLabel.trailingAnchor, constant: 10)
@@ -511,6 +590,7 @@ private final class HUDView: NSView {
         tint.layer?.cornerRadius = radius
         gloss.isHidden = isIdle
         transcriptLabel.preferredMaxLayoutWidth = transcriptLabel.bounds.width
+        if !scroll.isHidden { layoutScrollText() }
     }
 
     // MARK: State
@@ -552,10 +632,10 @@ private final class HUDView: NSView {
             stopPulse()
             waveform.isHidden = true
             elapsedLabel.font = .systemFont(ofSize: 11, weight: .semibold)
-            elapsedLabel.stringValue = translateLabel.isHidden ? "Transcribing" : "Translating"
             elapsedLabel.isHidden = false
             applyTranslateCaptionVisibility()
             applyUsageVisibility()
+            elapsedLabel.stringValue = translateLabel.isHidden ? "Transcribing" : "Translating"
             if transcriptLabel.stringValue.hasPrefix("Listening") {
                 transcriptLabel.stringValue = ""
             }
@@ -584,8 +664,84 @@ private final class HUDView: NSView {
             applyUsageVisibility()
             transcriptLabel.textColor = NSColor.white.withAlphaComponent(0.78)
             transcriptLabel.stringValue = message
+
+        case .offerReplace(let translation):
+            enterExpanded()
+            dot.layer?.backgroundColor = NSColor.systemTeal.cgColor
+            stopPulse()
+            waveform.isHidden = true
+            elapsedLabel.isHidden = true
+            targetLabel.stringValue = ""
+            targetIcon.isHidden = true
+            applyTranslateCaptionVisibility()
+            applyUsageVisibility()
+            let font = NSFont.systemFont(ofSize: 13)
+            transcriptLabel.font = font
+            transcriptLabel.stringValue = ""
+            scrollText.stringValue = translation
+            let textHeight = (translation as NSString).boundingRect(
+                with: NSSize(width: 400, height: 4000),
+                options: [.usesLineFragmentOrigin, .usesFontLeading],
+                attributes: [.font: font]).height
+            let line = max(font.boundingRectForFont.height, 16)
+            let visible = min(max(ceil(textHeight), line), line * 12)
+            offerPanelHeight = 36 + 8 + visible + 8 + 28 + 14
+            showReplaceButton(true)
+            layoutScrollText()
+        }
+        if case .offerReplace = state {
+        } else {
+            transcriptLabel.maximumNumberOfLines = 1
+            transcriptLabel.usesSingleLineMode = true
+            transcriptLabel.cell?.wraps = false
+            transcriptLabel.lineBreakMode = .byTruncatingHead
+            showReplaceButton(false)
         }
         needsLayout = true
+    }
+
+    private func showReplaceButton(_ show: Bool) {
+        replaceButton.isHidden = !show
+        copyButton.isHidden = !show
+        scroll.isHidden = !show
+        transcriptLabel.isHidden = show
+        transcriptToBottom.isActive = !show
+        transcriptAboveReplace.isActive = false
+        for constraint in scrollConstraints { constraint.isActive = show }
+    }
+
+    private func styleAction(_ button: NSButton, title: String) {
+        button.isBordered = false
+        button.contentTintColor = NSColor.white.withAlphaComponent(0.92)
+        button.wantsLayer = true
+        button.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.14).cgColor
+        button.layer?.cornerRadius = 6
+        button.attributedTitle = NSAttributedString(
+            string: title,
+            attributes: [
+                .foregroundColor: NSColor.white.withAlphaComponent(0.92),
+                .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+            ])
+    }
+
+    private func layoutScrollText() {
+        let width = max(scroll.contentView.bounds.width, 400)
+        scrollText.preferredMaxLayoutWidth = width
+        let height = max(scrollText.intrinsicContentSize.height, 20)
+        scrollText.frame = NSRect(x: 0, y: 0, width: width, height: height)
+    }
+
+    @objc private func replaceClicked() {
+        onReplace()
+    }
+
+    @objc private func copyClicked() {
+        let text = scrollText.stringValue
+        guard !text.isEmpty else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        onOfferClosed()
     }
 
     private func enterExpanded() {
